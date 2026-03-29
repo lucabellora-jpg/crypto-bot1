@@ -1,664 +1,769 @@
-import { useState, useCallback } from "react";
-import { AreaChart, Area, LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid } from "recharts";
- 
-function parseLogs(text) {
-  const cycles = [];
-  const trades = [];
-  let currentCycle = null;
-  const lines = text.split("\n");
-  for (const line of lines) {
-    const cm = line.match(/── Cycle #(\d+) \| (\d+:\d+:\d+) \| Balance: \$([0-9.]+) \| Positions: (\d+)\/(\d+)/);
-    if (cm) {
-      if (currentCycle) cycles.push(currentCycle);
-      currentCycle = { num: +cm[1], time: cm[2], balance: +cm[3], positions: +cm[4], maxPos: +cm[5], coins: {} };
-      continue;
+"""
+=============================================================
+  CRYPTO BOT — DASHBOARD DE MONITOREO
+  Servidor local que abre en tu navegador
+=============================================================
+
+CÓMO USAR:
+  1. Abrí una SEGUNDA terminal en PyCharm (el bot corre en la primera)
+  2. Corré este archivo: python dashboard.py
+  3. Abrí tu navegador en: http://localhost:8080
+  4. El dashboard se actualiza solo cada 30 segundos
+
+NO necesita pip install — usa solo librerías de Python estándar.
+=============================================================
+"""
+
+import http.server
+import json
+import os
+import re
+from datetime import datetime
+
+# Archivos que genera el bot (deben estar en la misma carpeta)
+LEARNING_FILE   = "bot_learning.json"
+TRADE_LOG_FILE  = "trade_history.log"
+BOT_LOG_FILE    = "bot.log"
+
+PORT = 8080
+
+
+# =============================================================
+#   LECTURA DE DATOS
+# =============================================================
+
+def read_learning() -> dict:
+    if not os.path.exists(LEARNING_FILE):
+        return {}
+    try:
+        with open(LEARNING_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def read_trades() -> list:
+    """Parsea trade_history.log y devuelve lista de dicts."""
+    if not os.path.exists(TRADE_LOG_FILE):
+        return []
+    trades = []
+    try:
+        with open(TRADE_LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                # Formato: FECHA | SIDE | SYMBOL | precio=X | qty=Y | pnl=Z% | MOTIVO
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) < 5:
+                    continue
+                trade = {
+                    "time"  : parts[0] if len(parts) > 0 else "",
+                    "side"  : parts[1] if len(parts) > 1 else "",
+                    "symbol": parts[2] if len(parts) > 2 else "",
+                    "price" : "",
+                    "qty"   : "",
+                    "pnl"   : "",
+                    "reason": parts[5] if len(parts) > 5 else "",
+                }
+                for part in parts:
+                    if part.startswith("precio="):
+                        trade["price"] = part.replace("precio=", "").replace("$", "").replace(",", "")
+                    elif part.startswith("qty="):
+                        trade["qty"] = part.replace("qty=", "")
+                    elif part.startswith("pnl="):
+                        trade["pnl"] = part.replace("pnl=", "").replace("%", "")
+                trades.append(trade)
+    except Exception:
+        pass
+    return list(reversed(trades))   # Más recientes primero
+
+
+def read_bot_status() -> dict:
+    """Lee las últimas líneas del bot.log para saber si está vivo."""
+    if not os.path.exists(BOT_LOG_FILE):
+        return {"running": False, "last_line": "Bot no iniciado aún.", "last_time": "—"}
+    try:
+        with open(BOT_LOG_FILE, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f.readlines() if l.strip()]
+        if not lines:
+            return {"running": False, "last_line": "Sin actividad.", "last_time": "—"}
+        last = lines[-1]
+        # Extraer timestamp de la última línea
+        match = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", last)
+        last_time = match.group(1) if match else "—"
+        # El bot está "vivo" si escribió en el log en los últimos 5 minutos
+        alive = False
+        if match:
+            try:
+                t = datetime.strptime(last_time, "%Y-%m-%d %H:%M:%S")
+                diff = (datetime.now() - t).total_seconds()
+                alive = diff < 300
+            except Exception:
+                pass
+        return {"running": alive, "last_line": last[-120:], "last_time": last_time}
+    except Exception:
+        return {"running": False, "last_line": "Error leyendo log.", "last_time": "—"}
+
+
+def build_api_data() -> dict:
+    learning = read_learning()
+    trades   = read_trades()
+    status   = read_bot_status()
+
+    total  = learning.get("total_trades", 0)
+    wins   = learning.get("total_wins", 0)
+    wr     = round(wins / total * 100, 1) if total > 0 else 0
+
+    # Calcular PnL acumulado desde los trades con pnl
+    pnl_total = 0.0
+    for t in trades:
+        if t["pnl"]:
+            try:
+                pnl_total += float(t["pnl"])
+            except Exception:
+                pass
+    pnl_total = round(pnl_total, 2)
+
+    # Stats por moneda desde learning
+    sym_stats = learning.get("symbol_stats", {})
+
+    # Parámetros actuales
+    params = learning.get("params", {})
+
+    # Últimos ajustes de aprendizaje
+    experiments = learning.get("param_experiments", [])
+    last_exp = experiments[-1] if experiments else None
+
+    return {
+        "status"    : status,
+        "total"     : total,
+        "wins"      : wins,
+        "win_rate"  : wr,
+        "pnl_total" : pnl_total,
+        "sym_stats" : sym_stats,
+        "params"    : params,
+        "last_exp"  : last_exp,
+        "trades"    : trades[:50],    # Últimos 50
     }
-    const coin = line.match(/(\w+USDT)\s+\$\s*([0-9.]+) \| RSI=\s*([0-9.]+) \| Score=(\d+)\/(\d+) \| Vol x([0-9.]+)/);
-    if (coin && currentCycle) {
-      currentCycle.coins[coin[1]] = { price: +coin[2], rsi: +coin[3], score: +coin[4], vol: +coin[6] };
-    }
-    const op = line.match(/✔ OPEN (\w+) @ \$([0-9.]+) \| Qty:([0-9.]+) \| SL:\$([0-9.]+) \| TP:\$([0-9.]+) \| Score:(\d+)\/(\d+)/);
-    if (op) trades.push({ type: "open", coin: op[1], price: +op[2], qty: +op[3], sl: +op[4], tp: +op[5], score: `${op[6]}/${op[7]}`, cycle: currentCycle?.num, time: currentCycle?.time });
-    const cl = line.match(/✔ CLOSE (\w+) @ \$([0-9.]+) \| PnL: ([+-][0-9.]+%) \| (.+)/);
-    if (cl) trades.push({ type: "close", coin: cl[1], price: +cl[2], pnl: cl[3], reason: cl[4].trim(), cycle: currentCycle?.num, time: currentCycle?.time });
+
+
+# =============================================================
+#   HTML DEL DASHBOARD
+# =============================================================
+
+HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crypto Bot — Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0e13;
+    --surface: #111620;
+    --surface2: #181e2c;
+    --border: rgba(255,255,255,0.07);
+    --text: #e8eaf0;
+    --muted: #6b7280;
+    --green: #10d98c;
+    --green-dim: rgba(16,217,140,0.12);
+    --red: #f05252;
+    --red-dim: rgba(240,82,82,0.12);
+    --blue: #5b8ff9;
+    --blue-dim: rgba(91,143,249,0.12);
+    --amber: #f5a623;
+    --amber-dim: rgba(245,166,35,0.12);
   }
-  if (currentCycle) cycles.push(currentCycle);
-  return { cycles, trades };
-}
- 
-const INITIAL_LOG = `2026-03-29T20:58:24.600321883Z [inf]  2026-03-29 20:58:23 [INFO] =======================================================
-2026-03-29T20:58:24.600330112Z [inf]  2026-03-29 20:58:23 [INFO]   ADAPTIVE BOT v2 — VOLATILE ALTCOINS
-2026-03-29T20:58:24.600341571Z [inf]  2026-03-29 20:58:23 [INFO]   Coins     : SOLUSDT, DOGEUSDT, AVAXUSDT, POLUSDT, LINKUSDT, DOTUSDT, ADAUSDT, LTCUSDT
-2026-03-29T20:58:24.600350953Z [inf]  2026-03-29 20:58:23 [INFO]   Interval  : 5m | Mode: TESTNET
-2026-03-29T20:58:24.600359024Z [inf]  2026-03-29 20:58:23 [INFO]   Max hold  : 4h | Cooldown: 15min | CB: -30%
-2026-03-29T20:58:24.600367595Z [inf]  2026-03-29 20:58:23 [INFO] =======================================================
-2026-03-29T20:58:24.600403689Z [inf]  2026-03-29 20:58:23 [INFO] Starting balance: $3684.87
-── Cycle #1 | 20:58:23 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T20:58:24.600439964Z [inf]  2026-03-29 20:58:24 [INFO]   SOLUSDT      $   81.8700 | RSI= 61.5 | Score=0/6 | Vol x0.1
-2026-03-29T20:58:24.600448415Z [inf]  2026-03-29 20:58:24 [INFO]   DOGEUSDT     $    0.0910 | RSI= 64.8 | Score=0/6 | Vol x0.5
-2026-03-29T20:58:25.747563985Z [inf]  2026-03-29 20:58:24 [INFO]   AVAXUSDT     $    8.6400 | RSI= 62.5 | Score=0/6 | Vol x0.0
-2026-03-29T20:58:25.747570460Z [inf]  2026-03-29 20:58:24 [INFO]   POLUSDT      $    0.0925 | RSI= 66.7 | Score=0/6 | Vol x0.0
-2026-03-29T20:58:25.747583657Z [inf]  2026-03-29 20:58:25 [INFO]   LINKUSDT     $    8.4500 | RSI= 63.6 | Score=0/6 | Vol x0.0
-2026-03-29T20:58:25.747590322Z [inf]  2026-03-29 20:58:25 [INFO]   DOTUSDT      $    1.2590 | RSI= 69.2 | Score=0/6 | Vol x0.0
-2026-03-29T20:58:25.747597194Z [inf]  2026-03-29 20:58:25 [INFO]   ADAUSDT      $    0.2406 | RSI= 53.7 | Score=0/6 | Vol x0.1
-2026-03-29T20:58:26.771456512Z [inf]  2026-03-29 20:58:25 [INFO]   LTCUSDT      $   53.6200 | RSI= 80.5 | Score=0/6 | Vol x0.0
-── Cycle #2 | 20:59:25 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T20:59:28.895689734Z [inf]  2026-03-29 20:59:26 [INFO]   SOLUSDT      $   81.9400 | RSI= 64.8 | Score=1/6 | Vol x0.8
-2026-03-29T20:59:28.895695356Z [inf]  2026-03-29 20:59:26 [INFO]   DOGEUSDT     $    0.0910 | RSI= 64.0 | Score=1/6 | Vol x0.5
-2026-03-29T20:59:28.895701094Z [inf]  2026-03-29 20:59:27 [INFO]   AVAXUSDT     $    8.6400 | RSI= 62.5 | Score=0/6 | Vol x0.0
-2026-03-29T20:59:28.895706547Z [inf]  2026-03-29 20:59:27 [INFO]   POLUSDT      $    0.0925 | RSI= 66.7 | Score=0/6 | Vol x0.0
-2026-03-29T20:59:28.895712854Z [inf]  2026-03-29 20:59:27 [INFO]   LINKUSDT     $    8.4500 | RSI= 63.6 | Score=0/6 | Vol x0.0
-2026-03-29T20:59:28.895720094Z [inf]  2026-03-29 20:59:27 [INFO]   DOTUSDT      $    1.2590 | RSI= 69.2 | Score=0/6 | Vol x0.0
-2026-03-29T20:59:28.895725331Z [inf]  2026-03-29 20:59:27 [INFO]   ADAUSDT      $    0.2406 | RSI= 53.7 | Score=0/6 | Vol x0.1
-2026-03-29T20:59:28.895725332Z [inf]  2026-03-29 20:59:27 [INFO]   LTCUSDT      $   53.6200 | RSI= 80.5 | Score=0/6 | Vol x0.0
-── Cycle #3 | 21:00:27 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:00:31.846344700Z [inf]  2026-03-29 21:00:28 [INFO]   SOLUSDT      $   81.9400 | RSI= 69.5 | Score=0/6 | Vol x0.2
-2026-03-29T21:00:31.846350663Z [inf]  2026-03-29 21:00:29 [INFO]   DOGEUSDT     $    0.0911 | RSI= 71.9 | Score=0/6 | Vol x0.2
-2026-03-29T21:00:31.846356580Z [inf]  2026-03-29 21:00:29 [INFO]   AVAXUSDT     $    8.6500 | RSI= 66.7 | Score=0/6 | Vol x0.2
-2026-03-29T21:00:31.846361391Z [inf]  2026-03-29 21:00:29 [INFO]   POLUSDT      $    0.0923 | RSI= 57.1 | Score=0/6 | Vol x0.0
-2026-03-29T21:00:31.846365288Z [inf]  2026-03-29 21:00:29 [INFO]   LINKUSDT     $    8.4600 | RSI= 66.7 | Score=0/6 | Vol x0.0
-2026-03-29T21:00:31.846369957Z [inf]  2026-03-29 21:00:30 [INFO]   DOTUSDT      $    1.2590 | RSI= 69.2 | Score=0/6 | Vol x0.0
-2026-03-29T21:00:31.846374053Z [inf]  2026-03-29 21:00:30 [INFO]   ADAUSDT      $    0.2406 | RSI= 59.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:00:31.846379709Z [inf]  2026-03-29 21:00:30 [INFO]   LTCUSDT      $   53.6200 | RSI= 80.0 | Score=0/6 | Vol x0.0
-── Cycle #4 | 21:01:30 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:01:34.119098923Z [inf]  2026-03-29 21:01:30 [INFO]   SOLUSDT      $   82.0200 | RSI= 72.2 | Score=0/6 | Vol x0.4
-2026-03-29T21:01:34.119106303Z [inf]  2026-03-29 21:01:31 [INFO]   DOGEUSDT     $    0.0912 | RSI= 74.8 | Score=1/6 | Vol x0.9
-2026-03-29T21:01:34.119113404Z [inf]  2026-03-29 21:01:31 [INFO]   AVAXUSDT     $    8.6600 | RSI= 70.0 | Score=0/6 | Vol x0.3
-2026-03-29T21:01:34.119120151Z [inf]  2026-03-29 21:01:31 [INFO]   POLUSDT      $    0.0923 | RSI= 57.1 | Score=1/6 | Vol x2.4
-2026-03-29T21:01:34.119126467Z [inf]  2026-03-29 21:01:31 [INFO]   LINKUSDT     $    8.4800 | RSI= 71.4 | Score=0/6 | Vol x0.0
-2026-03-29T21:01:34.119133190Z [inf]  2026-03-29 21:01:32 [INFO]   DOTUSDT      $    1.2610 | RSI= 73.3 | Score=1/6 | Vol x0.6
-2026-03-29T21:01:34.119140610Z [inf]  2026-03-29 21:01:32 [INFO]   ADAUSDT      $    0.2410 | RSI= 63.4 | Score=0/6 | Vol x0.1
-2026-03-29T21:01:34.119148370Z [inf]  2026-03-29 21:01:32 [INFO]   LTCUSDT      $   53.6200 | RSI= 80.0 | Score=0/6 | Vol x0.0
-── Cycle #5 | 21:02:32 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:02:35.488822290Z [inf]  2026-03-29 21:02:33 [INFO]   SOLUSDT      $   81.9600 | RSI= 70.2 | Score=1/6 | Vol x0.9
-2026-03-29T21:02:35.488827699Z [inf]  2026-03-29 21:02:33 [INFO]   DOGEUSDT     $    0.0911 | RSI= 73.0 | Score=1/6 | Vol x1.2
-2026-03-29T21:02:35.488832453Z [inf]  2026-03-29 21:02:33 [INFO]   AVAXUSDT     $    8.6600 | RSI= 70.0 | Score=0/6 | Vol x0.3
-2026-03-29T21:02:35.488837198Z [inf]  2026-03-29 21:02:33 [INFO]   POLUSDT      $    0.0923 | RSI= 57.1 | Score=1/6 | Vol x2.4
-2026-03-29T21:02:35.488842252Z [inf]  2026-03-29 21:02:33 [INFO]   LINKUSDT     $    8.4700 | RSI= 69.2 | Score=1/6 | Vol x0.9
-2026-03-29T21:02:35.488846780Z [inf]  2026-03-29 21:02:34 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=1/6 | Vol x1.1
-2026-03-29T21:02:35.488851879Z [inf]  2026-03-29 21:02:34 [INFO]   ADAUSDT      $    0.2411 | RSI= 64.3 | Score=0/6 | Vol x0.1
-2026-03-29T21:02:35.488857877Z [inf]  2026-03-29 21:02:34 [INFO]   LTCUSDT      $   53.6800 | RSI= 82.6 | Score=1/6 | Vol x0.5
-── Cycle #6 | 21:03:34 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:03:36.393796124Z [inf]  2026-03-29 21:03:35 [INFO]   SOLUSDT      $   81.9800 | RSI= 70.9 | Score=1/6 | Vol x0.9
-2026-03-29T21:03:36.393800393Z [inf]  2026-03-29 21:03:35 [INFO]   DOGEUSDT     $    0.0911 | RSI= 73.0 | Score=1/6 | Vol x1.2
-2026-03-29T21:03:36.393804939Z [inf]  2026-03-29 21:03:35 [INFO]   AVAXUSDT     $    8.6600 | RSI= 70.0 | Score=0/6 | Vol x0.3
-2026-03-29T21:03:36.393688267Z [inf]  2026-03-29 21:03:35 [INFO]   POLUSDT      $    0.0923 | RSI= 57.1 | Score=1/6 | Vol x2.4
-2026-03-29T21:03:36.393697413Z [inf]  2026-03-29 21:03:36 [INFO]   LINKUSDT     $    8.4700 | RSI= 69.2 | Score=1/6 | Vol x0.9
-2026-03-29T21:03:36.393705097Z [inf]  2026-03-29 21:03:36 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=1/6 | Vol x1.1
-2026-03-29T21:03:37.345716260Z [inf]  2026-03-29 21:03:36 [INFO]   ADAUSDT      $    0.2411 | RSI= 64.3 | Score=0/6 | Vol x0.1
-2026-03-29T21:03:37.345726196Z [inf]  2026-03-29 21:03:36 [INFO]   LTCUSDT      $   53.6300 | RSI= 80.5 | Score=1/6 | Vol x1.1
-── Cycle #7 | 21:04:36 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:04:37.914292513Z [inf]  2026-03-29 21:04:37 [INFO]   SOLUSDT      $   82.0000 | RSI= 71.6 | Score=1/6 | Vol x0.9
-2026-03-29T21:04:37.914267755Z [inf]  2026-03-29 21:04:37 [INFO]   DOGEUSDT     $    0.0911 | RSI= 73.0 | Score=1/6 | Vol x1.2
-2026-03-29T21:04:37.914275723Z [inf]  2026-03-29 21:04:37 [INFO]   AVAXUSDT     $    8.6600 | RSI= 70.0 | Score=0/6 | Vol x0.3
-2026-03-29T21:04:37.914280241Z [inf]  2026-03-29 21:04:36 [INFO]   POLUSDT      $    0.0923 | RSI= 57.1 | Score=1/6 | Vol x2.4
-2026-03-29T21:04:38.908954761Z [inf]  2026-03-29 21:04:38 [INFO]   LINKUSDT     $    8.4700 | RSI= 69.2 | Score=1/6 | Vol x0.9
-2026-03-29T21:04:38.908897310Z [inf]  2026-03-29 21:04:38 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=1/6 | Vol x1.1
-2026-03-29T21:04:38.908907540Z [inf]  2026-03-29 21:04:38 [INFO]   ADAUSDT      $    0.2407 | RSI= 60.5 | Score=0/6 | Vol x0.2
-2026-03-29T21:04:38.908915049Z [inf]  2026-03-29 21:04:38 [INFO]   LTCUSDT      $   53.6300 | RSI= 80.5 | Score=1/6 | Vol x1.1
-── Cycle #8 | 21:05:38 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:05:39.890101164Z [inf]  2026-03-29 21:05:39 [INFO]   SOLUSDT      $   82.0400 | RSI= 72.8 | Score=0/6 | Vol x0.4
-2026-03-29T21:05:39.890130012Z [inf]  2026-03-29 21:05:39 [INFO]   DOGEUSDT     $    0.0911 | RSI= 71.4 | Score=0/6 | Vol x0.0
-2026-03-29T21:05:39.890138112Z [inf]  2026-03-29 21:05:39 [INFO]   AVAXUSDT     $    8.6600 | RSI= 70.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:05:40.775994027Z [inf]  2026-03-29 21:05:39 [INFO]   POLUSDT      $    0.0923 | RSI= 57.1 | Score=0/6 | Vol x0.0
-2026-03-29T21:05:40.776001998Z [inf]  2026-03-29 21:05:40 [INFO]   LINKUSDT     $    8.4700 | RSI= 69.2 | Score=0/6 | Vol x0.0
-2026-03-29T21:05:40.776010445Z [inf]  2026-03-29 21:05:40 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:05:40.776017839Z [inf]  2026-03-29 21:05:40 [INFO]   ADAUSDT      $    0.2410 | RSI= 62.5 | Score=0/6 | Vol x0.1
-2026-03-29T21:05:40.859077388Z [inf]  2026-03-29 21:05:40 [INFO]   LTCUSDT      $   53.6300 | RSI= 84.6 | Score=0/6 | Vol x0.0
-── Cycle #9 | 21:06:40 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:06:51.125552985Z [inf]  2026-03-29 21:06:41 [INFO]   SOLUSDT      $   81.9900 | RSI= 70.8 | Score=0/6 | Vol x0.4
-2026-03-29T21:06:51.125568731Z [inf]  2026-03-29 21:06:41 [INFO]   DOGEUSDT     $    0.0911 | RSI= 70.2 | Score=0/6 | Vol x0.0
-2026-03-29T21:06:51.125575368Z [inf]  2026-03-29 21:06:41 [INFO]   AVAXUSDT     $    8.6600 | RSI= 70.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:06:51.125433338Z [inf]  2026-03-29 21:06:42 [INFO]   POLUSDT      $    0.0923 | RSI= 57.1 | Score=0/6 | Vol x0.0
-2026-03-29T21:06:51.125441782Z [inf]  2026-03-29 21:06:42 [INFO]   LINKUSDT     $    8.4700 | RSI= 69.2 | Score=0/6 | Vol x0.0
-2026-03-29T21:06:51.125450572Z [inf]  2026-03-29 21:06:42 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:06:51.125458620Z [inf]  2026-03-29 21:06:42 [INFO]   ADAUSDT      $    0.2409 | RSI= 61.5 | Score=0/6 | Vol x0.1
-2026-03-29T21:06:51.125465969Z [inf]  2026-03-29 21:06:42 [INFO]   LTCUSDT      $   53.6300 | RSI= 84.6 | Score=0/6 | Vol x0.0
-── Cycle #10 | 21:07:42 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:07:51.859677042Z [inf]  2026-03-29 21:07:43 [INFO]   SOLUSDT      $   81.9800 | RSI= 70.0 | Score=1/6 | Vol x0.5
-2026-03-29T21:07:51.859683554Z [inf]  2026-03-29 21:07:43 [INFO]   DOGEUSDT     $    0.0911 | RSI= 69.7 | Score=0/6 | Vol x0.1
-2026-03-29T21:07:51.859690647Z [inf]  2026-03-29 21:07:43 [INFO]   AVAXUSDT     $    8.6600 | RSI= 70.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:07:51.859697202Z [inf]  2026-03-29 21:07:44 [INFO]   POLUSDT      $    0.0923 | RSI= 57.1 | Score=0/6 | Vol x0.0
-2026-03-29T21:07:51.859703541Z [inf]  2026-03-29 21:07:44 [INFO]   LINKUSDT     $    8.4700 | RSI= 69.2 | Score=0/6 | Vol x0.0
-2026-03-29T21:07:51.859709773Z [inf]  2026-03-29 21:07:44 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:07:51.859716727Z [inf]  2026-03-29 21:07:44 [INFO]   ADAUSDT      $    0.2409 | RSI= 61.5 | Score=0/6 | Vol x0.1
-2026-03-29T21:07:51.859723485Z [inf]  2026-03-29 21:07:44 [INFO]   LTCUSDT      $   53.6200 | RSI= 82.5 | Score=1/6 | Vol x0.7
-── Cycle #11 | 21:08:44 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:08:53.445929437Z [inf]  2026-03-29 21:08:45 [INFO]   SOLUSDT      $   81.9000 | RSI= 64.3 | Score=1/6 | Vol x0.8
-2026-03-29T21:08:53.445936612Z [inf]  2026-03-29 21:08:45 [INFO]   DOGEUSDT     $    0.0911 | RSI= 69.7 | Score=0/6 | Vol x0.1
-2026-03-29T21:08:53.445885986Z [inf]  2026-03-29 21:08:45 [INFO]   AVAXUSDT     $    8.6600 | RSI= 70.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:08:53.445900949Z [inf]  2026-03-29 21:08:46 [INFO]   POLUSDT      $    0.0923 | RSI= 57.1 | Score=0/6 | Vol x0.0
-2026-03-29T21:08:53.445920755Z [inf]  2026-03-29 21:08:46 [INFO]   LINKUSDT     $    8.4700 | RSI= 69.2 | Score=0/6 | Vol x0.0
-2026-03-29T21:08:53.445827536Z [inf]  2026-03-29 21:08:46 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:08:53.445835235Z [inf]  2026-03-29 21:08:46 [INFO]   ADAUSDT      $    0.2409 | RSI= 61.5 | Score=0/6 | Vol x0.1
-2026-03-29T21:08:53.445841010Z [inf]  2026-03-29 21:08:47 [INFO]   LTCUSDT      $   53.6200 | RSI= 82.5 | Score=1/6 | Vol x0.7
-── Cycle #12 | 21:09:47 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:09:55.071481160Z [inf]  2026-03-29 21:09:47 [INFO]   SOLUSDT      $   81.8900 | RSI= 63.6 | Score=1/6 | Vol x1.0
-2026-03-29T21:09:55.071487762Z [inf]  2026-03-29 21:09:47 [INFO]   DOGEUSDT     $    0.0911 | RSI= 67.5 | Score=0/6 | Vol x0.1
-2026-03-29T21:09:55.071493594Z [inf]  2026-03-29 21:09:47 [INFO]   AVAXUSDT     $    8.6400 | RSI= 58.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:09:55.071322316Z [inf]  2026-03-29 21:09:48 [INFO]   POLUSDT      $    0.0923 | RSI= 57.1 | Score=0/6 | Vol x0.0
-2026-03-29T21:09:55.071337457Z [inf]  2026-03-29 21:09:48 [INFO]   LINKUSDT     $    8.4700 | RSI= 69.2 | Score=0/6 | Vol x0.0
-2026-03-29T21:09:55.071346894Z [inf]  2026-03-29 21:09:48 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:09:55.071353800Z [inf]  2026-03-29 21:09:48 [INFO]   ADAUSDT      $    0.2408 | RSI= 60.5 | Score=0/6 | Vol x0.2
-2026-03-29T21:09:55.071361458Z [inf]  2026-03-29 21:09:49 [INFO]   LTCUSDT      $   53.6200 | RSI= 82.5 | Score=1/6 | Vol x0.7
-── Cycle #13 | 21:10:49 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:10:57.708841265Z [inf]  2026-03-29 21:10:49 [INFO]   SOLUSDT      $   81.8700 | RSI= 57.3 | Score=0/6 | Vol x0.1
-2026-03-29T21:10:57.708851454Z [inf]  2026-03-29 21:10:49 [INFO]   DOGEUSDT     $    0.0911 | RSI= 63.4 | Score=0/6 | Vol x0.4
-2026-03-29T21:10:57.708805361Z [inf]  2026-03-29 21:10:50 [INFO]   AVAXUSDT     $    8.6400 | RSI= 58.3 | Score=0/6 | Vol x0.2
-2026-03-29T21:10:57.708813441Z [inf]  2026-03-29 21:10:50 [INFO]   POLUSDT      $    0.0923 | RSI= 61.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:10:57.708819283Z [inf]  2026-03-29 21:10:50 [INFO]   LINKUSDT     $    8.4700 | RSI= 66.7 | Score=0/6 | Vol x0.0
-2026-03-29T21:10:57.708772511Z [inf]  2026-03-29 21:10:50 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:10:57.708785399Z [inf]  2026-03-29 21:10:50 [INFO]   ADAUSDT      $    0.2408 | RSI= 60.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:10:57.708791960Z [inf]  2026-03-29 21:10:51 [INFO]   LTCUSDT      $   53.6200 | RSI= 79.4 | Score=0/6 | Vol x0.0
-── Cycle #14 | 21:11:51 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:11:57.877937669Z [inf]  2026-03-29 21:11:51 [INFO]   SOLUSDT      $   81.8900 | RSI= 58.6 | Score=1/6 | Vol x0.8
-2026-03-29T21:11:57.877943534Z [inf]  2026-03-29 21:11:51 [INFO]   DOGEUSDT     $    0.0911 | RSI= 63.7 | Score=0/6 | Vol x0.5
-2026-03-29T21:11:57.877950696Z [inf]  2026-03-29 21:11:52 [INFO]   AVAXUSDT     $    8.6500 | RSI= 61.5 | Score=0/6 | Vol x0.3
-2026-03-29T21:11:57.877959385Z [inf]  2026-03-29 21:11:52 [INFO]   POLUSDT      $    0.0921 | RSI= 53.3 | Score=1/6 | Vol x0.6
-2026-03-29T21:11:57.877966819Z [inf]  2026-03-29 21:11:52 [INFO]   LINKUSDT     $    8.4700 | RSI= 66.7 | Score=0/6 | Vol x0.0
-2026-03-29T21:11:57.877973429Z [inf]  2026-03-29 21:11:52 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:11:57.877980293Z [inf]  2026-03-29 21:11:53 [INFO]   ADAUSDT      $    0.2408 | RSI= 60.5 | Score=0/6 | Vol x0.1
-2026-03-29T21:11:57.877985437Z [inf]  2026-03-29 21:11:53 [INFO]   LTCUSDT      $   53.6200 | RSI= 79.4 | Score=0/6 | Vol x0.0
-── Cycle #15 | 21:12:53 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:12:58.766982333Z [inf]  2026-03-29 21:12:53 [INFO]   SOLUSDT      $   81.8800 | RSI= 58.0 | Score=1/6 | Vol x0.8
-2026-03-29T21:12:58.766991888Z [inf]  2026-03-29 21:12:53 [INFO]   DOGEUSDT     $    0.0911 | RSI= 63.7 | Score=0/6 | Vol x0.5
-2026-03-29T21:12:58.766998688Z [inf]  2026-03-29 21:12:54 [INFO]   AVAXUSDT     $    8.6500 | RSI= 61.5 | Score=0/6 | Vol x0.3
-2026-03-29T21:12:58.767004970Z [inf]  2026-03-29 21:12:54 [INFO]   POLUSDT      $    0.0921 | RSI= 53.3 | Score=1/6 | Vol x0.6
-2026-03-29T21:12:58.767011193Z [inf]  2026-03-29 21:12:54 [INFO]   LINKUSDT     $    8.4700 | RSI= 66.7 | Score=0/6 | Vol x0.0
-2026-03-29T21:12:58.766454832Z [inf]  2026-03-29 21:12:54 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:12:58.766462945Z [inf]  2026-03-29 21:12:55 [INFO]   LTCUSDT      $   53.6200 | RSI= 79.4 | Score=0/6 | Vol x0.0
-2026-03-29T21:12:58.766469903Z [inf]  2026-03-29 21:12:55 [INFO]   ADAUSDT      $    0.2408 | RSI= 60.5 | Score=0/6 | Vol x0.2
-── Cycle #16 | 21:13:55 | Balance: $3684.87 | Positions: 0/3 ──
-2026-03-29T21:14:00.922359796Z [inf]  2026-03-29 21:13:55 [INFO]   SOLUSDT      $   81.9300 | RSI= 60.4 | Score=1/6 | Vol x1.1
-2026-03-29T21:14:00.922365683Z [inf]  2026-03-29 21:13:56 [INFO]   DOGEUSDT     $    0.0912 | RSI= 66.1 | Score=2/6 | Vol x1.5
-2026-03-29T21:14:00.922371769Z [inf]  2026-03-29 21:13:56 [INFO]   AVAXUSDT     $    8.6500 | RSI= 61.5 | Score=0/6 | Vol x0.3
-2026-03-29T21:14:00.922378114Z [inf]  2026-03-29 21:13:56 [INFO]   POLUSDT      $    0.0921 | RSI= 53.3 | Score=1/6 | Vol x0.6
-2026-03-29T21:14:00.922204257Z [inf]  2026-03-29 21:13:56 [INFO]   LINKUSDT     $    8.4700 | RSI= 66.7 | Score=0/6 | Vol x0.0
-2026-03-29T21:14:00.922218410Z [inf]  2026-03-29 21:13:56 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:14:00.922227440Z [inf]  2026-03-29 21:13:57 [INFO]   ADAUSDT      $    0.2414 | RSI= 65.9 | Score=0/6 | Vol x0.2
-2026-03-29T21:14:00.922234973Z [inf]  2026-03-29 21:13:57 [INFO]   LTCUSDT      $   53.6200 | RSI= 79.4 | Score=0/6 | Vol x0.0
-2026-03-29T21:14:00.922240700Z [inf]  2026-03-29 21:13:58 [INFO]   ✔ OPEN DOGEUSDT @ $0.0912 | Qty:1077.0 | SL:$0.0885 | TP:$0.0967 | Score:2/6
-── Cycle #17 | 21:14:58 | Balance: $3586.68 | Positions: 1/3 ──
-2026-03-29T21:15:01.394216329Z [inf]  2026-03-29 21:14:58 [INFO]   SOLUSDT      $   81.9000 | RSI= 59.1 | Score=1/6 | Vol x1.1
-2026-03-29T21:15:01.394220851Z [inf]  2026-03-29 21:14:58 [INFO]   DOGEUSDT     $    0.0912 | RSI= 65.2 | Score=2/6 | Vol x1.5
-2026-03-29T21:15:01.394225223Z [inf]  2026-03-29 21:14:59 [INFO]   AVAXUSDT     $    8.6600 | RSI= 64.3 | Score=0/6 | Vol x0.3
-2026-03-29T21:15:01.394230350Z [inf]  2026-03-29 21:14:59 [INFO]   POLUSDT      $    0.0921 | RSI= 53.3 | Score=1/6 | Vol x0.6
-2026-03-29T21:15:01.394235181Z [inf]  2026-03-29 21:14:59 [INFO]   LINKUSDT     $    8.4700 | RSI= 66.7 | Score=0/6 | Vol x0.0
-2026-03-29T21:15:01.394240265Z [inf]  2026-03-29 21:14:59 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:15:01.394244820Z [inf]  2026-03-29 21:14:59 [INFO]   ADAUSDT      $    0.2414 | RSI= 65.9 | Score=0/6 | Vol x0.2
-2026-03-29T21:15:01.394258255Z [inf]  2026-03-29 21:15:00 [INFO]   LTCUSDT      $   53.6200 | RSI= 79.4 | Score=0/6 | Vol x0.0
-── Cycle #18 | 21:16:00 | Balance: $3586.68 | Positions: 1/3 ──
-2026-03-29T21:16:02.591305774Z [inf]  2026-03-29 21:16:00 [INFO]   SOLUSDT      $   81.8700 | RSI= 54.1 | Score=0/6 | Vol x0.4
-2026-03-29T21:16:02.591315473Z [inf]  2026-03-29 21:16:00 [INFO]   DOGEUSDT     $    0.0912 | RSI= 64.7 | Score=1/6 | Vol x0.0
-2026-03-29T21:16:02.591312373Z [inf]  2026-03-29 21:16:01 [INFO]   AVAXUSDT     $    8.6600 | RSI= 64.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:16:02.591322083Z [inf]  2026-03-29 21:16:01 [INFO]   POLUSDT      $    0.0921 | RSI= 53.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:16:02.591328799Z [inf]  2026-03-29 21:16:01 [INFO]   LINKUSDT     $    8.4700 | RSI= 63.6 | Score=0/6 | Vol x0.0
-2026-03-29T21:16:02.591335393Z [inf]  2026-03-29 21:16:01 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:16:02.591341317Z [inf]  2026-03-29 21:16:02 [INFO]   ADAUSDT      $    0.2413 | RSI= 57.9 | Score=0/6 | Vol x0.5
-2026-03-29T21:16:02.591177583Z [inf]  2026-03-29 21:16:02 [INFO]   LTCUSDT      $   53.6200 | RSI= 81.8 | Score=0/6 | Vol x0.0
-── Cycle #19 | 21:17:02 | Balance: $3586.68 | Positions: 1/3 ──
-2026-03-29T21:17:04.475243171Z [inf]  2026-03-29 21:17:02 [INFO]   SOLUSDT      $   81.8700 | RSI= 54.1 | Score=1/6 | Vol x0.6
-2026-03-29T21:17:04.475248747Z [inf]  2026-03-29 21:17:03 [INFO]   DOGEUSDT     $    0.0912 | RSI= 64.7 | Score=1/6 | Vol x0.0
-2026-03-29T21:17:04.475254568Z [inf]  2026-03-29 21:17:03 [INFO]   AVAXUSDT     $    8.6600 | RSI= 64.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:17:04.475260368Z [inf]  2026-03-29 21:17:03 [INFO]   POLUSDT      $    0.0921 | RSI= 53.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:17:04.475267309Z [inf]  2026-03-29 21:17:04 [INFO]   LINKUSDT     $    8.4700 | RSI= 63.6 | Score=0/6 | Vol x0.0
-2026-03-29T21:17:04.475273537Z [inf]  2026-03-29 21:17:04 [INFO]   DOTUSDT      $    1.2630 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:17:05.830700877Z [inf]  2026-03-29 21:17:04 [INFO]   ADAUSDT      $    0.2412 | RSI= 56.4 | Score=1/6 | Vol x0.8
-2026-03-29T21:17:05.830706965Z [inf]  2026-03-29 21:17:04 [INFO]   LTCUSDT      $   53.6300 | RSI= 82.3 | Score=0/6 | Vol x0.3
-── Cycle #20 | 21:18:04 | Balance: $3586.68 | Positions: 1/3 ──
-2026-03-29T21:18:06.607884544Z [inf]  2026-03-29 21:18:05 [INFO]   SOLUSDT      $   81.8700 | RSI= 54.1 | Score=1/6 | Vol x0.9
-2026-03-29T21:18:06.607889114Z [inf]  2026-03-29 21:18:05 [INFO]   DOGEUSDT     $    0.0912 | RSI= 64.7 | Score=1/6 | Vol x0.0
-2026-03-29T21:18:06.607893754Z [inf]  2026-03-29 21:18:05 [INFO]   AVAXUSDT     $    8.6600 | RSI= 64.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:18:06.607897659Z [inf]  2026-03-29 21:18:06 [INFO]   POLUSDT      $    0.0921 | RSI= 53.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:18:06.607906500Z [inf]  2026-03-29 21:18:06 [INFO]   LINKUSDT     $    8.4700 | RSI= 63.6 | Score=0/6 | Vol x0.0
-2026-03-29T21:18:06.607912046Z [inf]  2026-03-29 21:18:06 [INFO]   DOTUSDT      $    1.2640 | RSI= 77.8 | Score=1/6 | Vol x1.7
-2026-03-29T21:18:07.981977672Z [inf]  2026-03-29 21:18:06 [INFO]   ADAUSDT      $    0.2411 | RSI= 55.0 | Score=1/6 | Vol x0.9
-2026-03-29T21:18:07.981986885Z [inf]  2026-03-29 21:18:06 [INFO]   LTCUSDT      $   53.6300 | RSI= 82.3 | Score=0/6 | Vol x0.3
-── Cycle #21 | 21:19:06 | Balance: $3586.68 | Positions: 1/3 ──
-2026-03-29T21:19:09.634386389Z [inf]  2026-03-29 21:19:07 [INFO]   SOLUSDT      $   81.9100 | RSI= 56.6 | Score=1/6 | Vol x1.2
-2026-03-29T21:19:09.634395843Z [inf]  2026-03-29 21:19:07 [INFO]   DOGEUSDT     $    0.0912 | RSI= 65.5 | Score=0/6 | Vol x0.1
-2026-03-29T21:19:09.634407756Z [inf]  2026-03-29 21:19:07 [INFO]   AVAXUSDT     $    8.6600 | RSI= 64.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:19:09.634399356Z [inf]  2026-03-29 21:19:08 [INFO]   POLUSDT      $    0.0921 | RSI= 30.0 | Score=1/6 | Vol x0.0
-2026-03-29T21:19:09.634410500Z [inf]  2026-03-29 21:19:08 [INFO]   LINKUSDT     $    8.4600 | RSI= 58.3 | Score=0/6 | Vol x0.2
-2026-03-29T21:19:09.634419962Z [inf]  2026-03-29 21:19:08 [INFO]   DOTUSDT      $    1.2650 | RSI= 79.0 | Score=1/6 | Vol x3.4
-2026-03-29T21:19:09.634426869Z [inf]  2026-03-29 21:19:08 [INFO]   ADAUSDT      $    0.2413 | RSI= 57.9 | Score=1/6 | Vol x0.9
-2026-03-29T21:19:09.634403089Z [inf]  2026-03-29 21:19:09 [INFO]   LTCUSDT      $   53.6300 | RSI= 82.3 | Score=0/6 | Vol x0.3
-── Cycle #22 | 21:20:09 | Balance: $3586.68 | Positions: 1/3 ──
-2026-03-29T21:20:14.008608366Z [inf]  2026-03-29 21:20:09 [INFO]   SOLUSDT      $   81.8700 | RSI= 56.8 | Score=0/6 | Vol x0.0
-2026-03-29T21:20:14.008615496Z [inf]  2026-03-29 21:20:09 [INFO]   DOGEUSDT     $    0.0912 | RSI= 67.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:20:14.007766941Z [inf]  2026-03-29 21:20:09 [INFO]   AVAXUSDT     $    8.6600 | RSI= 64.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:20:14.007781908Z [inf]  2026-03-29 21:20:10 [INFO]   POLUSDT      $    0.0921 | RSI= 30.0 | Score=1/6 | Vol x0.0
-2026-03-29T21:20:14.007790081Z [inf]  2026-03-29 21:20:10 [INFO]   LINKUSDT     $    8.4700 | RSI= 70.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:20:14.007797400Z [inf]  2026-03-29 21:20:10 [INFO]   DOTUSDT      $    1.2650 | RSI= 77.8 | Score=0/6 | Vol x0.0
-2026-03-29T21:20:14.007808858Z [inf]  2026-03-29 21:20:10 [INFO]   ADAUSDT      $    0.2410 | RSI= 57.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:20:14.007816104Z [inf]  2026-03-29 21:20:11 [INFO]   LTCUSDT      $   53.6300 | RSI= 82.3 | Score=0/6 | Vol x0.0
-── Cycle #23 | 21:21:11 | Balance: $3586.68 | Positions: 1/3 ──
-2026-03-29T21:21:15.457897254Z [inf]  2026-03-29 21:21:13 [INFO]   ✔ CLOSE DOGEUSDT @ $0.0913 | PnL: +0.08% | SELL SIGNAL
-2026-03-29T21:21:15.458083510Z [inf]  2026-03-29 21:21:11 [INFO]   SOLUSDT      $   81.8900 | RSI= 57.8 | Score=0/6 | Vol x0.0
-2026-03-29T21:21:15.458092503Z [inf]  2026-03-29 21:21:11 [INFO]   DOGEUSDT     $    0.0913 | RSI= 69.7 | Score=1/6 | Vol x0.5
-2026-03-29T21:21:15.458098933Z [inf]  2026-03-29 21:21:12 [INFO]   AVAXUSDT     $    8.6600 | RSI= 64.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:21:15.458105369Z [inf]  2026-03-29 21:21:12 [INFO]   POLUSDT      $    0.0921 | RSI= 30.0 | Score=1/6 | Vol x0.0
-2026-03-29T21:21:15.458112496Z [inf]  2026-03-29 21:21:12 [INFO]   LINKUSDT     $    8.4500 | RSI= 58.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:21:15.458118316Z [inf]  2026-03-29 21:21:12 [INFO]   DOTUSDT      $    1.2660 | RSI= 79.0 | Score=0/6 | Vol x0.1
-2026-03-29T21:21:15.458124257Z [inf]  2026-03-29 21:21:13 [INFO]   ADAUSDT      $    0.2410 | RSI= 57.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:21:15.458132332Z [inf]  2026-03-29 21:21:13 [INFO]   LTCUSDT      $   53.6300 | RSI= 82.3 | Score=0/6 | Vol x0.0
-── Cycle #24 | 21:22:13 | Balance: $3684.97 | Positions: 0/3 ──
-2026-03-29T21:22:17.962977382Z [inf]  2026-03-29 21:22:13 [INFO]   SOLUSDT      $   81.9200 | RSI= 59.3 | Score=1/6 | Vol x0.1
-2026-03-29T21:22:17.962991999Z [inf]  2026-03-29 21:22:14 [INFO]   DOGEUSDT     $    0.0913 | RSI= 71.3 | Score=1/6 | Vol x2.1
-2026-03-29T21:22:17.963000435Z [inf]  2026-03-29 21:22:14 [INFO]   AVAXUSDT     $    8.6600 | RSI= 64.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:22:17.963008200Z [inf]  2026-03-29 21:22:14 [INFO]   POLUSDT      $    0.0921 | RSI= 30.0 | Score=1/6 | Vol x0.0
-2026-03-29T21:22:17.963015461Z [inf]  2026-03-29 21:22:14 [INFO]   LINKUSDT     $    8.4600 | RSI= 63.6 | Score=0/6 | Vol x0.0
-2026-03-29T21:22:17.963035519Z [inf]  2026-03-29 21:22:15 [INFO]   DOTUSDT      $    1.2660 | RSI= 79.0 | Score=0/6 | Vol x0.1
-2026-03-29T21:22:17.963044329Z [inf]  2026-03-29 21:22:15 [INFO]   ADAUSDT      $    0.2410 | RSI= 57.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:22:17.962966024Z [inf]  2026-03-29 21:22:15 [INFO]   LTCUSDT      $   53.6500 | RSI= 83.3 | Score=0/6 | Vol x0.1
-── Cycle #25 | 21:23:15 | Balance: $3684.97 | Positions: 0/3 ──
-2026-03-29T21:23:19.539107527Z [inf]  2026-03-29 21:23:15 [INFO]   SOLUSDT      $   81.9500 | RSI= 60.7 | Score=1/6 | Vol x0.1
-2026-03-29T21:23:19.539113821Z [inf]  2026-03-29 21:23:16 [INFO]   DOGEUSDT     $    0.0914 | RSI= 72.2 | Score=1/6 | Vol x2.9
-2026-03-29T21:23:19.539121033Z [inf]  2026-03-29 21:23:16 [INFO]   AVAXUSDT     $    8.6600 | RSI= 64.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:23:19.539127042Z [inf]  2026-03-29 21:23:16 [INFO]   POLUSDT      $    0.0921 | RSI= 30.0 | Score=1/6 | Vol x0.0
-2026-03-29T21:23:19.539134376Z [inf]  2026-03-29 21:23:16 [INFO]   LINKUSDT     $    8.4600 | RSI= 63.6 | Score=0/6 | Vol x0.0
-2026-03-29T21:23:19.539141075Z [inf]  2026-03-29 21:23:17 [INFO]   DOTUSDT      $    1.2660 | RSI= 79.0 | Score=0/6 | Vol x0.1
-2026-03-29T21:23:19.539146169Z [inf]  2026-03-29 21:23:17 [INFO]   ADAUSDT      $    0.2414 | RSI= 61.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:23:19.539150414Z [inf]  2026-03-29 21:23:17 [INFO]   LTCUSDT      $   53.6500 | RSI= 83.3 | Score=0/6 | Vol x0.1
-── Cycle #26 | 21:24:17 | Balance: $3684.97 | Positions: 0/3 ──
-2026-03-29T21:24:21.947630804Z [inf]  2026-03-29 21:24:18 [INFO]   SOLUSDT      $   81.9500 | RSI= 60.7 | Score=1/6 | Vol x0.4
-2026-03-29T21:24:21.947640149Z [inf]  2026-03-29 21:24:18 [INFO]   DOGEUSDT     $    0.0914 | RSI= 72.8 | Score=1/6 | Vol x3.0
-2026-03-29T21:24:21.947652050Z [inf]  2026-03-29 21:24:18 [INFO]   AVAXUSDT     $    8.6600 | RSI= 64.3 | Score=0/6 | Vol x0.0
-2026-03-29T21:24:21.947659526Z [inf]  2026-03-29 21:24:18 [INFO]   POLUSDT      $    0.0921 | RSI= 30.0 | Score=1/6 | Vol x0.0
-2026-03-29T21:24:21.947769012Z [inf]  2026-03-29 21:24:18 [INFO]   LINKUSDT     $    8.4700 | RSI= 70.0 | Score=1/6 | Vol x1.9
-2026-03-29T21:24:21.947778183Z [inf]  2026-03-29 21:24:19 [INFO]   DOTUSDT      $    1.2660 | RSI= 79.0 | Score=0/6 | Vol x0.1
-2026-03-29T21:24:21.947785042Z [inf]  2026-03-29 21:24:19 [INFO]   ADAUSDT      $    0.2414 | RSI= 61.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:24:21.947791391Z [inf]  2026-03-29 21:24:19 [INFO]   LTCUSDT      $   53.6500 | RSI= 83.3 | Score=0/6 | Vol x0.1
-── Cycle #27 | 21:25:19 | Balance: $3684.97 | Positions: 0/3 ──
-2026-03-29T21:25:23.772111528Z [inf]  2026-03-29 21:25:20 [INFO]   SOLUSDT      $   81.9000 | RSI= 50.7 | Score=0/6 | Vol x0.0
-2026-03-29T21:25:23.772258490Z [inf]  2026-03-29 21:25:20 [INFO]   DOGEUSDT     $    0.0914 | RSI= 68.4 | Score=0/6 | Vol x0.1
-2026-03-29T21:25:23.772277239Z [inf]  2026-03-29 21:25:20 [INFO]   AVAXUSDT     $    8.6600 | RSI= 61.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:25:23.772288195Z [inf]  2026-03-29 21:25:20 [INFO]   POLUSDT      $    0.0921 | RSI= 42.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:25:23.772295408Z [inf]  2026-03-29 21:25:21 [INFO]   LINKUSDT     $    8.4600 | RSI= 60.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:25:23.772303203Z [inf]  2026-03-29 21:25:21 [INFO]   DOTUSDT      $    1.2660 | RSI= 76.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:25:23.772311740Z [inf]  2026-03-29 21:25:21 [INFO]   ADAUSDT      $    0.2414 | RSI= 60.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:25:23.772320030Z [inf]  2026-03-29 21:25:21 [INFO]   LTCUSDT      $   53.6500 | RSI= 85.7 | Score=0/6 | Vol x0.0
-── Cycle #28 | 21:26:21 | Balance: $3684.97 | Positions: 0/3 ──
-2026-03-29T21:26:24.679279793Z [inf]  2026-03-29 21:26:22 [INFO]   SOLUSDT      $   81.9500 | RSI= 54.0 | Score=1/6 | Vol x0.2
-2026-03-29T21:26:24.679289956Z [inf]  2026-03-29 21:26:22 [INFO]   DOGEUSDT     $    0.0914 | RSI= 68.4 | Score=0/6 | Vol x0.1
-2026-03-29T21:26:24.679313135Z [inf]  2026-03-29 21:26:22 [INFO]   AVAXUSDT     $    8.6600 | RSI= 61.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:26:24.679324162Z [inf]  2026-03-29 21:26:22 [INFO]   POLUSDT      $    0.0921 | RSI= 42.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:26:24.679333126Z [inf]  2026-03-29 21:26:23 [INFO]   LINKUSDT     $    8.4600 | RSI= 60.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:26:24.679342188Z [inf]  2026-03-29 21:26:23 [INFO]   DOTUSDT      $    1.2660 | RSI= 76.5 | Score=1/6 | Vol x0.7
-2026-03-29T21:26:24.679349576Z [inf]  2026-03-29 21:26:23 [INFO]   ADAUSDT      $    0.2413 | RSI= 58.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:26:24.679283811Z [inf]  2026-03-29 21:26:23 [INFO]   LTCUSDT      $   53.6500 | RSI= 85.7 | Score=0/6 | Vol x0.0
-── Cycle #29 | 21:27:23 | Balance: $3684.97 | Positions: 0/3 ──
-2026-03-29T21:27:25.803789253Z [inf]  2026-03-29 21:27:24 [INFO]   SOLUSDT      $   81.9600 | RSI= 54.5 | Score=1/6 | Vol x0.5
-2026-03-29T21:27:25.803803691Z [inf]  2026-03-29 21:27:24 [INFO]   DOGEUSDT     $    0.0914 | RSI= 68.9 | Score=0/6 | Vol x0.1
-2026-03-29T21:27:25.803827944Z [inf]  2026-03-29 21:27:24 [INFO]   AVAXUSDT     $    8.6600 | RSI= 61.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:27:25.803836572Z [inf]  2026-03-29 21:27:24 [INFO]   POLUSDT      $    0.0921 | RSI= 42.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:27:25.803773991Z [inf]  2026-03-29 21:27:25 [INFO]   DOTUSDT      $    1.2660 | RSI= 76.5 | Score=1/6 | Vol x0.7
-2026-03-29T21:27:25.803768165Z [inf]  2026-03-29 21:27:25 [INFO]   LINKUSDT     $    8.4600 | RSI= 60.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:27:25.803754070Z [inf]  2026-03-29 21:27:25 [INFO]   ADAUSDT      $    0.2414 | RSI= 60.0 | Score=0/6 | Vol x0.1
-2026-03-29T21:27:26.724588527Z [inf]  2026-03-29 21:27:25 [INFO]   LTCUSDT      $   53.6800 | RSI= 86.8 | Score=0/6 | Vol x0.1
-── Cycle #30 | 21:28:25 | Balance: $3684.97 | Positions: 0/3 ──
-2026-03-29T21:28:29.403989683Z [inf]  2026-03-29 21:28:26 [INFO]   SOLUSDT      $   81.9900 | RSI= 56.2 | Score=2/6 | Vol x0.9
-2026-03-29T21:28:29.403998435Z [inf]  2026-03-29 21:28:26 [INFO]   DOGEUSDT     $    0.0914 | RSI= 68.4 | Score=0/6 | Vol x0.1
-2026-03-29T21:28:29.404006895Z [inf]  2026-03-29 21:28:26 [INFO]   AVAXUSDT     $    8.6600 | RSI= 61.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:28:29.404014749Z [inf]  2026-03-29 21:28:26 [INFO]   POLUSDT      $    0.0921 | RSI= 42.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:28:29.404021176Z [inf]  2026-03-29 21:28:27 [INFO]   LINKUSDT     $    8.4600 | RSI= 60.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:28:29.404028848Z [inf]  2026-03-29 21:28:27 [INFO]   DOTUSDT      $    1.2660 | RSI= 76.5 | Score=1/6 | Vol x1.4
-2026-03-29T21:28:29.404043793Z [inf]  2026-03-29 21:28:27 [INFO]   ADAUSDT      $    0.2415 | RSI= 61.0 | Score=0/6 | Vol x0.5
-2026-03-29T21:28:29.404051043Z [inf]  2026-03-29 21:28:27 [INFO]   LTCUSDT      $   53.6800 | RSI= 86.8 | Score=0/6 | Vol x0.1
-2026-03-29T21:28:29.404058679Z [inf]  2026-03-29 21:28:28 [INFO]   ✔ OPEN SOLUSDT @ $81.9900 | Qty:1.198 | SL:$79.5303 | TP:$86.9094 | Score:2/6
-── Cycle #31 | 21:29:28 | Balance: $3586.73 | Positions: 1/3 ──
-2026-03-29T21:29:31.636882282Z [inf]  2026-03-29 21:29:28 [INFO]   SOLUSDT      $   82.0000 | RSI= 56.8 | Score=2/6 | Vol x1.0
-2026-03-29T21:29:31.636893019Z [inf]  2026-03-29 21:29:29 [INFO]   DOGEUSDT     $    0.0914 | RSI= 68.4 | Score=0/6 | Vol x0.1
-2026-03-29T21:29:31.636900515Z [inf]  2026-03-29 21:29:29 [INFO]   AVAXUSDT     $    8.6600 | RSI= 61.5 | Score=0/6 | Vol x0.0
-2026-03-29T21:29:31.636908374Z [inf]  2026-03-29 21:29:29 [INFO]   POLUSDT      $    0.0921 | RSI= 42.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:29:31.636916403Z [inf]  2026-03-29 21:29:29 [INFO]   LINKUSDT     $    8.4700 | RSI= 66.7 | Score=0/6 | Vol x0.0
-2026-03-29T21:29:31.636922962Z [inf]  2026-03-29 21:29:30 [INFO]   DOTUSDT      $    1.2660 | RSI= 76.5 | Score=1/6 | Vol x1.5
-2026-03-29T21:29:31.636928578Z [inf]  2026-03-29 21:29:30 [INFO]   ADAUSDT      $    0.2415 | RSI= 61.0 | Score=0/6 | Vol x0.5
-2026-03-29T21:29:31.636935888Z [inf]  2026-03-29 21:29:30 [INFO]   LTCUSDT      $   53.6800 | RSI= 86.8 | Score=0/6 | Vol x0.1
-── Cycle #32 | 21:30:30 | Balance: $3586.73 | Positions: 1/3 ──
-2026-03-29T21:30:34.413830696Z [inf]  2026-03-29 21:30:31 [INFO]   SOLUSDT      $   81.9600 | RSI= 40.3 | Score=1/6 | Vol x0.2
-2026-03-29T21:30:34.413836314Z [inf]  2026-03-29 21:30:31 [INFO]   DOGEUSDT     $    0.0914 | RSI= 56.6 | Score=0/6 | Vol x0.3
-2026-03-29T21:30:34.412921634Z [inf]  2026-03-29 21:30:31 [INFO]   AVAXUSDT     $    8.6600 | RSI= 50.0 | Score=1/6 | Vol x1.7
-2026-03-29T21:30:34.412932166Z [inf]  2026-03-29 21:30:31 [INFO]   POLUSDT      $    0.0921 | RSI= 42.9 | Score=1/6 | Vol x0.0
-2026-03-29T21:30:34.412940171Z [inf]  2026-03-29 21:30:31 [INFO]   LINKUSDT     $    8.4700 | RSI= 50.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:30:34.412948553Z [inf]  2026-03-29 21:30:32 [INFO]   DOTUSDT      $    1.2660 | RSI= 69.2 | Score=0/6 | Vol x0.0
-2026-03-29T21:30:34.412956683Z [inf]  2026-03-29 21:30:32 [INFO]   ADAUSDT      $    0.2413 | RSI= 48.5 | Score=0/6 | Vol x0.4
-2026-03-29T21:30:34.412965298Z [inf]  2026-03-29 21:30:32 [INFO]   LTCUSDT      $   53.6800 | RSI= 66.7 | Score=0/6 | Vol x0.0
-── Cycle #33 | 21:31:32 | Balance: $3586.73 | Positions: 1/3 ──
-2026-03-29T21:31:36.704724664Z [inf]  2026-03-29 21:31:33 [INFO]   SOLUSDT      $   82.0000 | RSI= 43.5 | Score=1/6 | Vol x0.2
-2026-03-29T21:31:36.704730262Z [inf]  2026-03-29 21:31:33 [INFO]   DOGEUSDT     $    0.0914 | RSI= 59.4 | Score=1/6 | Vol x0.7
-2026-03-29T21:31:36.704736377Z [inf]  2026-03-29 21:31:33 [INFO]   AVAXUSDT     $    8.6600 | RSI= 50.0 | Score=1/6 | Vol x1.7
-2026-03-29T21:31:36.704743199Z [inf]  2026-03-29 21:31:33 [INFO]   POLUSDT      $    0.0921 | RSI= 42.9 | Score=1/6 | Vol x0.0
-2026-03-29T21:31:36.704751233Z [inf]  2026-03-29 21:31:34 [INFO]   LINKUSDT     $    8.4600 | RSI= 42.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:31:36.704756996Z [inf]  2026-03-29 21:31:34 [INFO]   DOTUSDT      $    1.2650 | RSI= 64.3 | Score=1/6 | Vol x1.1
-2026-03-29T21:31:36.704762561Z [inf]  2026-03-29 21:31:34 [INFO]   ADAUSDT      $    0.2414 | RSI= 50.0 | Score=1/6 | Vol x0.8
-2026-03-29T21:31:36.704767944Z [inf]  2026-03-29 21:31:34 [INFO]   LTCUSDT      $   53.6800 | RSI= 66.7 | Score=0/6 | Vol x0.0
-── Cycle #34 | 21:32:34 | Balance: $3586.73 | Positions: 1/3 ──
-2026-03-29T21:32:39.368085882Z [inf]  2026-03-29 21:32:35 [INFO]   SOLUSDT      $   81.9800 | RSI= 41.7 | Score=1/6 | Vol x0.3
-2026-03-29T21:32:39.368093415Z [inf]  2026-03-29 21:32:35 [INFO]   DOGEUSDT     $    0.0914 | RSI= 57.4 | Score=1/6 | Vol x0.8
-2026-03-29T21:32:39.368101692Z [inf]  2026-03-29 21:32:35 [INFO]   AVAXUSDT     $    8.6600 | RSI= 50.0 | Score=1/6 | Vol x1.7
-2026-03-29T21:32:39.368109890Z [inf]  2026-03-29 21:32:35 [INFO]   POLUSDT      $    0.0921 | RSI= 42.9 | Score=1/6 | Vol x0.0
-2026-03-29T21:32:39.368107840Z [inf]  2026-03-29 21:32:36 [INFO]   DOTUSDT      $    1.2650 | RSI= 64.3 | Score=1/6 | Vol x1.1
-2026-03-29T21:32:39.368117260Z [inf]  2026-03-29 21:32:36 [INFO]   LINKUSDT     $    8.4600 | RSI= 42.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:32:39.368121516Z [inf]  2026-03-29 21:32:36 [INFO]   ADAUSDT      $    0.2414 | RSI= 50.0 | Score=1/6 | Vol x0.8
-2026-03-29T21:32:39.368136158Z [inf]  2026-03-29 21:32:36 [INFO]   LTCUSDT      $   53.6800 | RSI= 66.7 | Score=0/6 | Vol x0.0
-── Cycle #35 | 21:33:36 | Balance: $3586.73 | Positions: 1/3 ──
-2026-03-29T21:33:39.690020569Z [inf]  2026-03-29 21:33:37 [INFO]   SOLUSDT      $   82.0700 | RSI= 49.3 | Score=1/6 | Vol x1.1
-2026-03-29T21:33:39.690027876Z [inf]  2026-03-29 21:33:37 [INFO]   DOGEUSDT     $    0.0914 | RSI= 57.4 | Score=1/6 | Vol x0.8
-2026-03-29T21:33:39.689997995Z [inf]  2026-03-29 21:33:37 [INFO]   AVAXUSDT     $    8.6600 | RSI= 50.0 | Score=1/6 | Vol x1.7
-2026-03-29T21:33:39.690008096Z [inf]  2026-03-29 21:33:38 [INFO]   POLUSDT      $    0.0921 | RSI= 42.9 | Score=1/6 | Vol x0.0
-2026-03-29T21:33:39.690054335Z [inf]  2026-03-29 21:33:38 [INFO]   LINKUSDT     $    8.4600 | RSI= 42.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:33:39.690065889Z [inf]  2026-03-29 21:33:39 [INFO]   DOTUSDT      $    1.2650 | RSI= 64.3 | Score=1/6 | Vol x1.1
-2026-03-29T21:33:39.690102035Z [inf]  2026-03-29 21:33:39 [INFO]   ADAUSDT      $    0.2415 | RSI= 51.5 | Score=1/6 | Vol x0.8
-2026-03-29T21:33:39.770596888Z [inf]  2026-03-29 21:33:39 [INFO]   LTCUSDT      $   53.6800 | RSI= 66.7 | Score=0/6 | Vol x0.0
-── Cycle #36 | 21:34:39 | Balance: $3586.73 | Positions: 1/3 ──
-2026-03-29T21:34:43.897580823Z [inf]  2026-03-29 21:34:40 [INFO]   SOLUSDT      $   82.1000 | RSI= 51.4 | Score=1/6 | Vol x1.6
-2026-03-29T21:34:43.897587627Z [inf]  2026-03-29 21:34:40 [INFO]   DOGEUSDT     $    0.0915 | RSI= 60.2 | Score=1/6 | Vol x0.9
-2026-03-29T21:34:43.897597834Z [inf]  2026-03-29 21:34:40 [INFO]   AVAXUSDT     $    8.6600 | RSI= 50.0 | Score=1/6 | Vol x4.2
-2026-03-29T21:34:43.897606551Z [inf]  2026-03-29 21:34:40 [INFO]   POLUSDT      $    0.0921 | RSI= 42.9 | Score=1/6 | Vol x0.0
-2026-03-29T21:34:43.897613893Z [inf]  2026-03-29 21:34:41 [INFO]   LINKUSDT     $    8.4600 | RSI= 42.9 | Score=0/6 | Vol x0.0
-2026-03-29T21:34:43.897505520Z [inf]  2026-03-29 21:34:41 [INFO]   DOTUSDT      $    1.2650 | RSI= 64.3 | Score=1/6 | Vol x1.1
-2026-03-29T21:34:43.897519167Z [inf]  2026-03-29 21:34:41 [INFO]   ADAUSDT      $    0.2416 | RSI= 52.9 | Score=1/6 | Vol x1.3
-2026-03-29T21:34:43.897528600Z [inf]  2026-03-29 21:34:41 [INFO]   LTCUSDT      $   53.6800 | RSI= 66.7 | Score=0/6 | Vol x0.0
-── Cycle #37 | 21:35:41 | Balance: $3586.73 | Positions: 1/3 ──
-2026-03-29T21:35:45.139043898Z [inf]  2026-03-29 21:35:42 [INFO]   SOLUSDT      $   82.1200 | RSI= 57.4 | Score=1/6 | Vol x0.6
-2026-03-29T21:35:45.139049976Z [inf]  2026-03-29 21:35:42 [INFO]   DOGEUSDT     $    0.0914 | RSI= 59.0 | Score=0/6 | Vol x0.0
-2026-03-29T21:35:45.138423242Z [inf]  2026-03-29 21:35:42 [INFO]   AVAXUSDT     $    8.6600 | RSI= 44.4 | Score=0/6 | Vol x0.0
-2026-03-29T21:35:45.138430207Z [inf]  2026-03-29 21:35:42 [INFO]   POLUSDT      $    0.0921 | RSI= 50.0 | Score=1/6 | Vol x0.0
-2026-03-29T21:35:45.138438011Z [inf]  2026-03-29 21:35:43 [INFO]   LINKUSDT     $    8.4800 | RSI= 55.6 | Score=0/6 | Vol x0.0
-2026-03-29T21:35:45.138450196Z [inf]  2026-03-29 21:35:43 [INFO]   DOTUSDT      $    1.2640 | RSI= 57.1 | Score=0/6 | Vol x0.0
-2026-03-29T21:35:45.138459243Z [inf]  2026-03-29 21:35:43 [INFO]   ADAUSDT      $    0.2416 | RSI= 48.4 | Score=0/6 | Vol x0.0
-2026-03-29T21:35:45.138469665Z [inf]  2026-03-29 21:35:43 [INFO]   LTCUSDT      $   53.6800 | RSI= 61.5 | Score=0/6 | Vol x0.0
-── Cycle #38 | 21:36:43 | Balance: $3586.73 | Positions: 1/3 ──
-2026-03-29T21:36:47.890344430Z [inf]  2026-03-29 21:36:44 [INFO]   SOLUSDT      $   82.1300 | RSI= 58.0 | Score=1/6 | Vol x1.2
-2026-03-29T21:36:47.890359127Z [inf]  2026-03-29 21:36:44 [INFO]   DOGEUSDT     $    0.0915 | RSI= 61.3 | Score=1/6 | Vol x0.8
-2026-03-29T21:36:47.890367777Z [inf]  2026-03-29 21:36:44 [INFO]   AVAXUSDT     $    8.6600 | RSI= 44.4 | Score=0/6 | Vol x0.0
-2026-03-29T21:36:47.890377919Z [inf]  2026-03-29 21:36:45 [INFO]   POLUSDT      $    0.0921 | RSI= 50.0 | Score=1/6 | Vol x0.0
-2026-03-29T21:36:47.890386557Z [inf]  2026-03-29 21:36:45 [INFO]   LINKUSDT     $    8.4800 | RSI= 55.6 | Score=0/6 | Vol x0.0
-2026-03-29T21:36:47.890395102Z [inf]  2026-03-29 21:36:45 [INFO]   DOTUSDT      $    1.2650 | RSI= 60.0 | Score=0/6 | Vol x0.1
-2026-03-29T21:36:47.890401720Z [inf]  2026-03-29 21:36:45 [INFO]   ADAUSDT      $    0.2415 | RSI= 46.9 | Score=1/6 | Vol x0.7
-2026-03-29T21:36:47.890409656Z [inf]  2026-03-29 21:36:45 [INFO]   LTCUSDT      $   53.6800 | RSI= 61.5 | Score=0/6 | Vol x0.0`;
- 
-function rsiColor(rsi) {
-  if (rsi >= 75) return "#dc2626";
-  if (rsi >= 65) return "#d97706";
-  if (rsi <= 35) return "#2563eb";
-  if (rsi <= 45) return "#0ea5e9";
-  return "#059669";
-}
- 
-function rsiLabel(rsi) {
-  if (rsi >= 75) return "SOBRECOMPRA";
-  if (rsi >= 65) return "ALTO";
-  if (rsi <= 35) return "SOBREVENTA";
-  if (rsi <= 45) return "BAJO";
-  return "NEUTRO";
-}
- 
-function detectStaleCoins(cycles) {
-  if (cycles.length < 5) return [];
-  const last = cycles.slice(-6);
-  const stale = [];
-  const coins = Object.keys(last[0]?.coins || {});
-  for (const c of coins) {
-    const rsiVals = last.map(cy => cy.coins[c]?.rsi).filter(v => v != null);
-    if (rsiVals.length >= 4 && rsiVals.every(v => v === rsiVals[0])) {
-      stale.push(c);
-    }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Syne', sans-serif;
+    font-size: 14px;
+    min-height: 100vh;
+    padding: 0 0 3rem;
   }
-  return stale;
-}
- 
-const SUGGESTIONS = [
-  { level: "critical", icon: "!", title: "Stale RSI data detectado", body: "DOTUSDT tuvo RSI=76.5 fijo por ~18 ciclos seguidos y POLUSDT RSI=30.0 por 6 ciclos. Agregá un check: si el RSI no cambia en N ciclos, excluí el coin o forzá refresh de datos." },
-  { level: "warning", icon: "~", title: "Umbral de entrada muy bajo", body: "El bot abre trades con Score=2/6 (mínimo). Considerá subir el threshold a 3/6 para mayor calidad de señal y menos falsos positivos." },
-  { level: "warning", icon: "~", title: "Salida prematura en DOGE", body: "DOGE se cerró a +0.08% por SELL SIGNAL cuando el TP estaba en +6.1% ($0.0967). Revisá si la condición de SELL SIGNAL es demasiado sensible. Considerá trailing stop en vez de señal de venta fija." },
-  { level: "info", icon: "i", title: "LTC persistentemente sobrecomprado", body: "LTC mostró RSI 79-87 durante casi toda la sesión. El bot es long-only y lo descarta correctamente, pero podrías agregar alertas cuando un coin está >75 por más de 5 ciclos." },
-  { level: "info", icon: "i", title: "Dashboard no accesible en puerto 8080", body: "El bot reporta 'Dashboard on port 8080' pero no podés verlo. Asegurate de mapear el puerto en Docker: -p 8080:8080. O usá este dashboard como alternativa pegando el log." },
-  { level: "info", icon: "i", title: "Ciclo ligeramente irregular", body: "Los ciclos deberían ser ~60s pero algunos tienen delays de hasta 2 min. Investigá si hay latencia en la API o en el procesamiento de datos." },
-];
- 
-export default function BotDashboard() {
-  const [logText, setLogText] = useState(INITIAL_LOG);
-  const [showPaste, setShowPaste] = useState(false);
-  const [rawPaste, setRawPaste] = useState("");
-  const [tab, setTab] = useState("overview");
- 
-  const { cycles, trades } = parseLogs(logText);
-  const lastCycle = cycles[cycles.length - 1];
-  const firstCycle = cycles[0];
-  const staleCoins = detectStaleCoins(cycles);
- 
-  const balanceHistory = cycles.map(c => ({ cycle: c.num, balance: parseFloat(c.balance.toFixed(2)) }));
-  const openTrades = [], closedTrades = [];
-  for (let i = 0; i < trades.length; i++) {
-    const t = trades[i];
-    if (t.type === "open") {
-      const close = trades.slice(i + 1).find(x => x.type === "close" && x.coin === t.coin);
-      if (close) closedTrades.push({ ...t, exitPrice: close.price, pnl: close.pnl, reason: close.reason, exitCycle: close.cycle });
-      else openTrades.push(t);
-    }
+
+  /* ── Header ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1.25rem 2rem;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: rgba(11,14,19,0.95);
+    backdrop-filter: blur(8px);
+    z-index: 100;
   }
-  const allCoins = lastCycle ? Object.entries(lastCycle.coins) : [];
-  const solPos = openTrades.find(t => t.coin === "SOLUSDT");
-  const unrealPnl = solPos ? (((lastCycle?.coins?.SOLUSDT?.price || solPos.price) - solPos.price) / solPos.price * 100) : null;
- 
-  const handlePaste = () => {
-    if (rawPaste.trim()) setLogText(rawPaste);
-    setShowPaste(false);
-    setRawPaste("");
-  };
- 
-  const tabs = ["overview", "coins", "trades", "suggestions"];
-  const tabLabels = { overview: "Overview", coins: "Coins", trades: "Trades", suggestions: `Sugerencias (${SUGGESTIONS.length})` };
- 
-  const levelColor = { critical: "var(--color-text-danger)", warning: "var(--color-text-warning)", info: "var(--color-text-info)" };
-  const levelBg = { critical: "var(--color-background-danger)", warning: "var(--color-background-warning)", info: "var(--color-background-info)" };
-  const levelBorder = { critical: "var(--color-border-danger)", warning: "var(--color-border-warning)", info: "var(--color-border-info)" };
- 
-  return (
-    <div style={{ fontFamily: "var(--font-sans)", padding: "1rem 0", maxWidth: 900 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-        <div>
-          <div style={{ fontSize: 11, color: "var(--color-text-secondary)", letterSpacing: 1, textTransform: "uppercase", marginBottom: 2 }}>Adaptive Bot v2 · Testnet · 5m</div>
-          <div style={{ fontSize: 18, fontWeight: 500, color: "var(--color-text-primary)" }}>Bot Supervision Dashboard</div>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#059669" }}></div>
-          <span style={{ fontSize: 12, color: "var(--color-text-secondary)" }}>Running · Cycle #{lastCycle?.num || "—"}</span>
-          <button onClick={() => setShowPaste(!showPaste)} style={{ fontSize: 12, padding: "4px 10px", marginLeft: 8 }}>
-            {showPaste ? "Cancelar" : "Pegar nuevo log ↗"}
-          </button>
-        </div>
-      </div>
- 
-      {showPaste && (
-        <div style={{ marginBottom: 16, background: "var(--color-background-secondary)", border: "0.5px solid var(--color-border-secondary)", borderRadius: "var(--border-radius-lg)", padding: "1rem" }}>
-          <div style={{ fontSize: 13, color: "var(--color-text-secondary)", marginBottom: 8 }}>Pegá el contenido del log para actualizar el dashboard:</div>
-          <textarea value={rawPaste} onChange={e => setRawPaste(e.target.value)} rows={6} style={{ width: "100%", fontSize: 12, fontFamily: "var(--font-mono)", resize: "vertical", boxSizing: "border-box" }} placeholder="Paste log content here..." />
-          <button onClick={handlePaste} style={{ marginTop: 8 }}>Cargar log ↗</button>
-        </div>
-      )}
- 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 10, marginBottom: 16 }}>
-        {[
-          { label: "Balance actual", value: `$${lastCycle?.balance?.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) || "—"}` },
-          { label: "Posiciones", value: `${lastCycle?.positions || 0}/${lastCycle?.maxPos || 3}` },
-          { label: "Trades cerrados", value: `${closedTrades.length}` },
-          { label: "PnL no realizado", value: unrealPnl != null ? `${unrealPnl >= 0 ? "+" : ""}${unrealPnl.toFixed(2)}%` : "—", color: unrealPnl != null ? (unrealPnl >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)") : undefined },
-        ].map(m => (
-          <div key={m.label} style={{ background: "var(--color-background-secondary)", borderRadius: "var(--border-radius-md)", padding: "0.75rem 1rem" }}>
-            <div style={{ fontSize: 11, color: "var(--color-text-secondary)", marginBottom: 4 }}>{m.label}</div>
-            <div style={{ fontSize: 20, fontWeight: 500, fontFamily: "var(--font-mono)", color: m.color || "var(--color-text-primary)" }}>{m.value}</div>
-          </div>
-        ))}
-      </div>
- 
-      <div style={{ display: "flex", gap: 0, marginBottom: 16, borderBottom: "0.5px solid var(--color-border-tertiary)" }}>
-        {tabs.map(t => (
-          <button key={t} onClick={() => setTab(t)} style={{ background: "transparent", border: "none", borderBottom: tab === t ? "2px solid var(--color-text-primary)" : "2px solid transparent", borderRadius: 0, padding: "6px 14px", fontSize: 13, fontWeight: tab === t ? 500 : 400, color: tab === t ? "var(--color-text-primary)" : "var(--color-text-secondary)", cursor: "pointer" }}>
-            {tabLabels[t]}
-          </button>
-        ))}
-      </div>
- 
-      {tab === "overview" && (
-        <div>
-          <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 6 }}>Balance por ciclo</div>
-          <div style={{ position: "relative", width: "100%", height: 180 }}>
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={balanceHistory} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(120,120,120,0.12)" />
-                <XAxis dataKey="cycle" tick={{ fontSize: 11 }} stroke="none" />
-                <YAxis domain={["auto", "auto"]} tick={{ fontSize: 11 }} stroke="none" width={70} tickFormatter={v => `$${v.toFixed(0)}`} />
-                <Tooltip formatter={(v) => [`$${v.toFixed(2)}`, "Balance"]} labelFormatter={l => `Ciclo #${l}`} contentStyle={{ fontSize: 12, border: "0.5px solid var(--color-border-secondary)", borderRadius: 6 }} />
-                <ReferenceLine y={3684.87} stroke="#6b7280" strokeDasharray="4 2" label={{ value: "Inicio", position: "right", fontSize: 10, fill: "#6b7280" }} />
-                <Area type="monotone" dataKey="balance" stroke="#2563eb" fill="rgba(37,99,235,0.08)" strokeWidth={1.5} dot={false} />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
- 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 16 }}>
-            <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "1rem" }}>
-              <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 10 }}>Posición abierta</div>
-              {openTrades.length === 0 ? <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>Sin posiciones abiertas</div> : openTrades.map(t => {
-                const curr = lastCycle?.coins?.[t.coin]?.price;
-                const pct = curr ? ((curr - t.price) / t.price * 100) : null;
-                const dist_sl = ((t.price - t.sl) / t.price * 100).toFixed(1);
-                const dist_tp = ((t.tp - t.price) / t.price * 100).toFixed(1);
-                return (
-                  <div key={t.coin}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
-                      <span style={{ fontSize: 15, fontWeight: 500 }}>{t.coin}</span>
-                      <span style={{ fontSize: 14, fontFamily: "var(--font-mono)", color: pct != null ? (pct >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)") : "var(--color-text-primary)" }}>
-                        {pct != null ? `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%` : "—"}
-                      </span>
-                    </div>
-                    <div style={{ fontSize: 12, color: "var(--color-text-secondary)", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 12px" }}>
-                      <span>Entrada: <b style={{ color: "var(--color-text-primary)", fontFamily: "var(--font-mono)" }}>${t.price}</b></span>
-                      <span>Precio: <b style={{ color: "var(--color-text-primary)", fontFamily: "var(--font-mono)" }}>${curr || "—"}</b></span>
-                      <span>SL: <b style={{ color: "var(--color-text-danger)", fontFamily: "var(--font-mono)" }}>${t.sl} (-{dist_sl}%)</b></span>
-                      <span>TP: <b style={{ color: "var(--color-text-success)", fontFamily: "var(--font-mono)" }}>${t.tp} (+{dist_tp}%)</b></span>
-                      <span>Qty: <b style={{ color: "var(--color-text-primary)" }}>{t.qty}</b></span>
-                      <span>Score: <b style={{ color: "var(--color-text-primary)" }}>{t.score}</b></span>
-                    </div>
-                    <div style={{ marginTop: 10, height: 6, background: "var(--color-background-secondary)", borderRadius: 3, overflow: "hidden", position: "relative" }}>
-                      {curr && (() => {
-                        const range = t.tp - t.sl;
-                        const pos = Math.max(0, Math.min(1, (curr - t.sl) / range));
-                        return <div style={{ position: "absolute", left: `${pos * 100}%`, top: 0, width: 3, height: "100%", background: "#2563eb", borderRadius: 2, transform: "translateX(-50%)" }} />;
-                      })()}
-                      <div style={{ position: "absolute", left: 0, top: 0, width: "3px", height: "100%", background: "var(--color-text-danger)", borderRadius: 2 }} />
-                      <div style={{ position: "absolute", right: 0, top: 0, width: "3px", height: "100%", background: "var(--color-text-success)", borderRadius: 2 }} />
-                    </div>
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--color-text-tertiary)", marginTop: 2 }}>
-                      <span>SL</span><span>TP</span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-            <div style={{ background: "var(--color-background-primary)", border: "0.5px solid var(--color-border-tertiary)", borderRadius: "var(--border-radius-lg)", padding: "1rem" }}>
-              <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 10 }}>Alertas activas</div>
-              {staleCoins.length > 0 && (
-                <div style={{ background: "var(--color-background-danger)", border: "0.5px solid var(--color-border-danger)", borderRadius: "var(--border-radius-md)", padding: "8px 10px", marginBottom: 8, fontSize: 12 }}>
-                  <span style={{ color: "var(--color-text-danger)", fontWeight: 500 }}>RSI estático detectado: </span>
-                  <span style={{ color: "var(--color-text-danger)" }}>{staleCoins.join(", ")}</span>
-                </div>
-              )}
-              {SUGGESTIONS.filter(s => s.level !== "info").map((s, i) => (
-                <div key={i} style={{ background: levelBg[s.level], border: `0.5px solid ${levelBorder[s.level]}`, borderRadius: "var(--border-radius-md)", padding: "8px 10px", marginBottom: 8, fontSize: 12 }}>
-                  <span style={{ color: levelColor[s.level], fontWeight: 500 }}>{s.title}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
- 
-      {tab === "coins" && (
-        <div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 10 }}>
-            {allCoins.map(([coin, data]) => {
-              const isOpen = openTrades.some(t => t.coin === coin);
-              const isStale = staleCoins.includes(coin);
-              return (
-                <div key={coin} style={{ background: "var(--color-background-primary)", border: `0.5px solid ${isOpen ? "var(--color-border-info)" : isStale ? "var(--color-border-danger)" : "var(--color-border-tertiary)"}`, borderRadius: "var(--border-radius-lg)", padding: "0.875rem 1rem", position: "relative" }}>
-                  {isOpen && <span style={{ position: "absolute", top: 8, right: 8, fontSize: 10, padding: "2px 6px", background: "var(--color-background-info)", color: "var(--color-text-info)", borderRadius: 4 }}>OPEN</span>}
-                  {isStale && <span style={{ position: "absolute", top: 8, right: 8, fontSize: 10, padding: "2px 6px", background: "var(--color-background-danger)", color: "var(--color-text-danger)", borderRadius: 4 }}>STALE</span>}
-                  <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}>{coin.replace("USDT", "")}</div>
-                  <div style={{ fontSize: 17, fontFamily: "var(--font-mono)", marginBottom: 8, color: "var(--color-text-primary)" }}>${data.price}</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                    <div style={{ flex: 1, height: 4, background: "var(--color-background-secondary)", borderRadius: 2, overflow: "hidden" }}>
-                      <div style={{ width: `${data.rsi}%`, height: "100%", background: rsiColor(data.rsi), borderRadius: 2 }} />
-                    </div>
-                    <span style={{ fontSize: 12, fontFamily: "var(--font-mono)", color: rsiColor(data.rsi), fontWeight: 500, minWidth: 36 }}>{data.rsi.toFixed(1)}</span>
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--color-text-secondary)" }}>
-                    <span style={{ color: rsiColor(data.rsi) }}>{rsiLabel(data.rsi)}</span>
-                    <span>Vol x{data.vol.toFixed(1)} · Score {data.score}/6</span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
- 
-      {tab === "trades" && (
-        <div>
-          {openTrades.length > 0 && (
-            <div style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>Posiciones abiertas</div>
-              {openTrades.map((t, i) => (
-                <div key={i} style={{ background: "var(--color-background-info)", border: "0.5px solid var(--color-border-info)", borderRadius: "var(--border-radius-lg)", padding: "0.875rem 1rem", marginBottom: 8 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span style={{ fontSize: 14, fontWeight: 500, color: "var(--color-text-info)" }}>{t.coin} · BUY · Ciclo #{t.cycle}</span>
-                    <span style={{ fontSize: 12, color: "var(--color-text-info)" }}>Score {t.score} · Qty {t.qty}</span>
-                  </div>
-                  <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginTop: 4 }}>
-                    Entrada: ${t.price} · SL: ${t.sl} · TP: ${t.tp}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-          <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.5 }}>Trades cerrados</div>
-          {closedTrades.length === 0 ? <div style={{ fontSize: 13, color: "var(--color-text-secondary)" }}>Sin trades cerrados aún</div> : closedTrades.map((t, i) => {
-            const pnlNum = parseFloat(t.pnl);
-            return (
-              <div key={i} style={{ background: pnlNum >= 0 ? "var(--color-background-success)" : "var(--color-background-danger)", border: `0.5px solid ${pnlNum >= 0 ? "var(--color-border-success)" : "var(--color-border-danger)"}`, borderRadius: "var(--border-radius-lg)", padding: "0.875rem 1rem", marginBottom: 8 }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                  <span style={{ fontSize: 14, fontWeight: 500, color: pnlNum >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{t.coin}</span>
-                  <span style={{ fontSize: 16, fontFamily: "var(--font-mono)", fontWeight: 500, color: pnlNum >= 0 ? "var(--color-text-success)" : "var(--color-text-danger)" }}>{t.pnl}</span>
-                </div>
-                <div style={{ fontSize: 12, color: "var(--color-text-secondary)", marginTop: 4 }}>
-                  Ciclo #{t.cycle} #{t.exitCycle} · ${t.price} → ${t.exitPrice} · {t.reason} · Score {t.score}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
- 
-      {tab === "suggestions" && (
-        <div>
-          {SUGGESTIONS.map((s, i) => (
-            <div key={i} style={{ border: `0.5px solid ${levelBorder[s.level]}`, borderRadius: "var(--border-radius-lg)", padding: "0.875rem 1rem", marginBottom: 10, background: levelBg[s.level] }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                <span style={{ width: 20, height: 20, borderRadius: "50%", background: levelColor[s.level], display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: "#fff", fontWeight: 500, flexShrink: 0 }}>{s.icon}</span>
-                <span style={{ fontSize: 13, fontWeight: 500, color: levelColor[s.level] }}>{s.title}</span>
-                <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 3, background: levelColor[s.level], color: "#fff", marginLeft: "auto" }}>{s.level}</span>
-              </div>
-              <div style={{ fontSize: 13, color: "var(--color-text-secondary)", lineHeight: 1.6, paddingLeft: 28 }}>{s.body}</div>
-            </div>
-          ))}
-        </div>
-      )}
- 
-      <div style={{ marginTop: 16, fontSize: 11, color: "var(--color-text-tertiary)", fontFamily: "var(--font-mono)" }}>
-        {cycles.length} ciclos · {firstCycle?.time} → {lastCycle?.time} UTC · SOLUSDT, DOGEUSDT, AVAXUSDT, POLUSDT, LINKUSDT, DOTUSDT, ADAUSDT, LTCUSDT
+  .logo {
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--text);
+  }
+  .logo span { color: var(--green); }
+  .header-right { display: flex; align-items: center; gap: 1.5rem; }
+  .refresh-info {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .status-pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 5px 14px;
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    animation: pulse 2s infinite;
+  }
+  .dot.on  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot.off { background: var(--red);   animation: none; }
+  @keyframes pulse {
+    0%,100% { opacity: 1; }
+    50%      { opacity: 0.4; }
+  }
+
+  /* ── Layout ── */
+  .main { padding: 2rem; max-width: 1400px; margin: 0 auto; }
+
+  /* ── Metric cards ── */
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.25rem 1.5rem;
+  }
+  .card-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 0.6rem;
+  }
+  .card-value {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 28px;
+    font-weight: 500;
+    line-height: 1;
+  }
+  .card-sub {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 0.4rem;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+  .green { color: var(--green); }
+  .red   { color: var(--red); }
+  .blue  { color: var(--blue); }
+  .amber { color: var(--amber); }
+
+  /* ── Win rate bar ── */
+  .wr-bar-wrap {
+    background: rgba(255,255,255,0.06);
+    border-radius: 4px;
+    height: 4px;
+    margin-top: 10px;
+    overflow: hidden;
+  }
+  .wr-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    background: var(--green);
+    transition: width 0.8s ease;
+  }
+
+  /* ── Two-column grid ── */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  /* ── Section titles ── */
+  .section-title {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 1rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .section-title::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* ── Coin table ── */
+  .coin-row {
+    display: grid;
+    grid-template-columns: 1fr 60px 60px 80px 100px;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+    gap: 8px;
+  }
+  .coin-row:last-child { border-bottom: none; }
+  .coin-name {
+    font-weight: 700;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .coin-tag {
+    font-size: 10px;
+    font-family: 'IBM Plex Mono', monospace;
+    background: var(--surface2);
+    padding: 2px 7px;
+    border-radius: 4px;
+    color: var(--muted);
+  }
+  .mono { font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
+  .mini-bar-wrap {
+    background: rgba(255,255,255,0.06);
+    border-radius: 3px;
+    height: 3px;
+    width: 60px;
+  }
+  .mini-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+  }
+
+  /* ── Trade history ── */
+  .trade-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .trade-table th {
+    text-align: left;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 0 12px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .trade-table td {
+    padding: 9px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-family: 'IBM Plex Mono', monospace;
+    vertical-align: middle;
+  }
+  .trade-table tr:last-child td { border-bottom: none; }
+  .trade-table tr:hover td { background: rgba(255,255,255,0.02); }
+  .badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-family: 'Syne', sans-serif;
+  }
+  .badge-buy  { background: var(--green-dim); color: var(--green); }
+  .badge-sell { background: var(--red-dim);   color: var(--red); }
+
+  /* ── Params box ── */
+  .param-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+  .param-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 7px 10px;
+    background: var(--surface2);
+    border-radius: 6px;
+  }
+  .param-key  { font-size: 11px; color: var(--muted); }
+  .param-val  { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--blue); }
+
+  /* ── Last log line ── */
+  .log-line {
+    background: var(--surface2);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    word-break: break-all;
+    margin-top: 1rem;
+    border-left: 3px solid var(--border);
+  }
+
+  /* ── Learning alert ── */
+  .learn-alert {
+    background: var(--amber-dim);
+    border: 1px solid rgba(245,166,35,0.2);
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 12px;
+    color: var(--amber);
+    margin-top: 10px;
+  }
+
+  /* ── Empty state ── */
+  .empty {
+    text-align: center;
+    padding: 2rem;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  /* ── Footer ── */
+  footer {
+    text-align: center;
+    margin-top: 3rem;
+    font-size: 11px;
+    color: var(--muted);
+    font-family: 'IBM Plex Mono', monospace;
+  }
+
+  @media (max-width: 900px) {
+    .metrics { grid-template-columns: 1fr 1fr; }
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">CRYPTO<span>BOT</span> · Monitor</div>
+  <div class="header-right">
+    <div class="refresh-info">Actualiza cada 30s · <span id="countdown">30</span>s</div>
+    <div class="status-pill" id="status-pill">
+      <div class="dot off" id="status-dot"></div>
+      <span id="status-text">Cargando...</span>
+    </div>
+  </div>
+</header>
+
+<div class="main">
+
+  <!-- ── Métricas principales ── -->
+  <div class="metrics">
+    <div class="card">
+      <div class="card-label">Total Trades</div>
+      <div class="card-value blue" id="m-trades">—</div>
+      <div class="card-sub" id="m-wl">— ganados / — perdidos</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Win Rate</div>
+      <div class="card-value" id="m-wr" style="color:var(--text)">—</div>
+      <div class="wr-bar-wrap"><div class="wr-bar-fill" id="wr-bar" style="width:0%"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-label">PnL Acumulado</div>
+      <div class="card-value" id="m-pnl">—</div>
+      <div class="card-sub">suma de todos los trades cerrados</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Último ajuste</div>
+      <div class="card-value amber" id="m-adj">—</div>
+      <div class="card-sub" id="m-adj-sub">aprendizaje automático</div>
+    </div>
+  </div>
+
+  <div class="grid-3">
+
+    <!-- ── Historial de trades ── -->
+    <div class="card">
+      <div class="section-title">Últimas operaciones</div>
+      <div id="trade-list">
+        <div class="empty">Sin trades registrados aún.<br>El bot los irá mostrando aquí.</div>
       </div>
     </div>
-  );
+
+    <!-- ── Columna derecha ── -->
+    <div style="display:flex;flex-direction:column;gap:1rem;">
+
+      <!-- Rendimiento por moneda -->
+      <div class="card">
+        <div class="section-title">Rendimiento por moneda</div>
+        <div id="coin-list">
+          <div class="empty">Sin datos aún.</div>
+        </div>
+      </div>
+
+      <!-- Parámetros actuales del bot -->
+      <div class="card">
+        <div class="section-title">Parámetros actuales</div>
+        <div class="param-grid" id="params-grid">
+          <div class="empty" style="grid-column:1/-1">Sin datos aún.</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Estado del bot ── -->
+  <div class="card">
+    <div class="section-title">Última línea del log</div>
+    <div class="log-line" id="log-line">Esperando datos del bot...</div>
+  </div>
+
+</div>
+
+<footer>
+  Actualizando desde archivos locales · http://localhost:8080 · Datos en tiempo real
+</footer>
+
+<script>
+const COIN_NAMES = {
+  SOLUSDT:'Solana',DOGEUSDT:'Dogecoin',AVAXUSDT:'Avalanche',
+  POLUSDT:'Polygon',LINKUSDT:'Chainlink',DOTUSDT:'Polkadot',
+  ADAUSDT:'Cardano',LTCUSDT:'Litecoin',BTCUSDT:'Bitcoin',ETHUSDT:'Ethereum'
+};
+
+async function fetchData() {
+  try {
+    const r = await fetch('/api/data');
+    return await r.json();
+  } catch(e) {
+    return null;
+  }
 }
+
+function fmt(n, dec=2) {
+  if (n === null || n === undefined || n === '') return '—';
+  return parseFloat(n).toFixed(dec);
+}
+
+function render(data) {
+  if (!data) return;
+
+  // Status
+  const alive = data.status.running;
+  document.getElementById('status-dot').className  = 'dot ' + (alive ? 'on' : 'off');
+  document.getElementById('status-text').textContent = alive ? 'Bot activo' : 'Bot detenido';
+
+  // Métricas
+  document.getElementById('m-trades').textContent = data.total || '0';
+  document.getElementById('m-wl').textContent =
+    `${data.wins} ganados / ${data.total - data.wins} perdidos`;
+
+  const wr = data.win_rate;
+  const wrEl = document.getElementById('m-wr');
+  wrEl.textContent = wr + '%';
+  wrEl.style.color = wr >= 55 ? 'var(--green)' : wr >= 45 ? 'var(--amber)' : 'var(--red)';
+  document.getElementById('wr-bar').style.width = Math.min(wr, 100) + '%';
+  document.getElementById('wr-bar').style.background =
+    wr >= 55 ? 'var(--green)' : wr >= 45 ? 'var(--amber)' : 'var(--red)';
+
+  const pnl = data.pnl_total;
+  const pnlEl = document.getElementById('m-pnl');
+  pnlEl.textContent = (pnl >= 0 ? '+' : '') + fmt(pnl) + '%';
+  pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+
+  // Último ajuste de aprendizaje
+  const le = data.last_exp;
+  if (le) {
+    document.getElementById('m-adj').textContent = 'Trade #' + le.at_trade;
+    document.getElementById('m-adj-sub').textContent =
+      (le.adjustments && le.adjustments.length > 0)
+        ? le.adjustments.join(' · ')
+        : 'Sin cambios en ese ciclo';
+  }
+
+  // Log
+  document.getElementById('log-line').textContent =
+    data.status.last_line || 'Sin actividad reciente.';
+
+  // Trades
+  const trades = data.trades || [];
+  const tradeEl = document.getElementById('trade-list');
+  if (trades.length === 0) {
+    tradeEl.innerHTML = '<div class="empty">Sin trades registrados aún.<br>El bot los irá mostrando aquí.</div>';
+  } else {
+    const rows = trades.slice(0, 20).map(t => {
+      const isBuy  = t.side.trim().toUpperCase() === 'BUY';
+      const pnl    = t.pnl !== '' ? parseFloat(t.pnl) : null;
+      const pnlStr = pnl !== null
+        ? `<span style="color:${pnl >= 0 ? 'var(--green)' : 'var(--red)'}">${pnl >= 0 ? '+' : ''}${fmt(pnl)}%</span>`
+        : '<span style="color:var(--muted)">—</span>';
+      const sym = (t.symbol || '').trim();
+      return `<tr>
+        <td style="color:var(--muted);font-size:10px">${(t.time||'').slice(11,16)}</td>
+        <td><span class="badge ${isBuy ? 'badge-buy' : 'badge-sell'}">${t.side.trim()}</span></td>
+        <td style="color:var(--text)">${sym.replace('USDT','')}</td>
+        <td>$${parseFloat(t.price||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})}</td>
+        <td>${pnlStr}</td>
+        <td style="color:var(--muted);font-size:10px">${(t.reason||'').trim().slice(0,15)}</td>
+      </tr>`;
+    }).join('');
+    tradeEl.innerHTML = `<table class="trade-table">
+      <thead><tr>
+        <th>Hora</th><th>Tipo</th><th>Moneda</th><th>Precio</th><th>PnL</th><th>Motivo</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  }
+
+  // Coins
+  const stats = data.sym_stats || {};
+  const coinEl = document.getElementById('coin-list');
+  const coinKeys = Object.keys(stats);
+  if (coinKeys.length === 0) {
+    coinEl.innerHTML = '<div class="empty">Sin datos aún.</div>';
+  } else {
+    const sorted = coinKeys.sort((a,b) => {
+      const wrA = stats[a].trades > 0 ? stats[a].wins/stats[a].trades : 0;
+      const wrB = stats[b].trades > 0 ? stats[b].wins/stats[b].trades : 0;
+      return wrB - wrA;
+    });
+    coinEl.innerHTML = sorted.map(sym => {
+      const s  = stats[sym];
+      const wr = s.trades > 0 ? Math.round(s.wins / s.trades * 100) : 0;
+      const pnl = s.total_pnl || 0;
+      const color = wr >= 55 ? 'var(--green)' : wr >= 40 ? 'var(--amber)' : 'var(--red)';
+      const name = COIN_NAMES[sym] || sym;
+      return `<div class="coin-row">
+        <div class="coin-name">
+          ${name.slice(0,8)}
+          <span class="coin-tag">${sym.replace('USDT','')}</span>
+        </div>
+        <div class="mono" style="color:var(--muted)">${s.trades}t</div>
+        <div class="mono" style="color:${color}">${wr}%</div>
+        <div class="mono" style="color:${pnl>=0?'var(--green)':'var(--red)'}">
+          ${pnl >= 0 ? '+' : ''}${fmt(pnl)}%
+        </div>
+        <div>
+          <div class="mini-bar-wrap">
+            <div class="mini-bar-fill" style="width:${wr}%;background:${color}"></div>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  // Params
+  const params = data.params || {};
+  const paramEl = document.getElementById('params-grid');
+  const LABELS = {
+    rsi_period:'RSI período', rsi_oversold:'RSI compra',
+    rsi_overbought:'RSI venta', fast_ema:'EMA rápida',
+    slow_ema:'EMA lenta', min_score:'Score mínimo',
+    bb_period:'BB período', volume_factor:'Vol. factor',
+  };
+  const paramKeys = Object.keys(LABELS).filter(k => params[k] !== undefined);
+  if (paramKeys.length === 0) {
+    paramEl.innerHTML = '<div class="empty" style="grid-column:1/-1">Sin datos aún.</div>';
+  } else {
+    paramEl.innerHTML = paramKeys.map(k => `
+      <div class="param-row">
+        <span class="param-key">${LABELS[k]}</span>
+        <span class="param-val">${params[k]}</span>
+      </div>`).join('');
+  }
+}
+
+// Countdown y refresh
+let seconds = 30;
+function tick() {
+  seconds--;
+  document.getElementById('countdown').textContent = seconds;
+  if (seconds <= 0) {
+    seconds = 30;
+    fetchData().then(render);
+  }
+}
+
+// Carga inicial
+fetchData().then(render);
+setInterval(tick, 1000);
+</script>
+</body>
+</html>
+"""
+
+
+# =============================================================
+#   SERVIDOR HTTP
+# =============================================================
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass    # Silenciar logs del servidor en la terminal
+
+    def do_GET(self):
+        if self.path == "/" or self.path == "/index.html":
+            self._serve_html()
+        elif self.path == "/api/data":
+            self._serve_data()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _serve_html(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(HTML.encode("utf-8"))
+
+    def _serve_data(self):
+        data = build_api_data()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode("utf-8"))
+
+
+# =============================================================
+#   MAIN
+# =============================================================
+
+if __name__ == "__main__":
+    print("=" * 55)
+    print("  CRYPTO BOT — DASHBOARD")
+    print(f"  Abrí tu navegador en: http://localhost:{PORT}")
+    print("  Presioná Ctrl+C para detener el dashboard.")
+    print("=" * 55)
+    print(f"\n  Leyendo archivos:")
+    print(f"    {LEARNING_FILE}  {'✔ encontrado' if os.path.exists(LEARNING_FILE) else '— esperando que el bot lo genere'}")
+    print(f"    {TRADE_LOG_FILE} {'✔ encontrado' if os.path.exists(TRADE_LOG_FILE) else '— esperando trades'}")
+    print(f"    {BOT_LOG_FILE}   {'✔ encontrado' if os.path.exists(BOT_LOG_FILE) else '— bot no iniciado aún'}\n")
+
+    server = http.server.HTTPServer(("localhost", PORT), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nDashboard detenido.")
