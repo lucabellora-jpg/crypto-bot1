@@ -362,7 +362,7 @@ def analyze_symbol(candles, params):
         "sell_signal": sell,
         "detail": detail,
         "sl_pct": max(BASE_STOP_LOSS, atr_pct * 1.5),
-        "tp_pct": max(BASE_TAKE_PROFIT, atr_pct * 3.0),
+        "tp_pct": max(BASE_TAKE_PROFIT, atr_pct * 4.5),
         "atr": atr, "vol_ratio": vol_r, "macd_hist": mh,
     }
 
