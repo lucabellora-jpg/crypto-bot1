@@ -25,7 +25,7 @@ LEARNING_FILE   = "bot_learning.json"
 TRADE_LOG_FILE  = "trade_history.log"
 BOT_LOG_FILE    = "bot.log"
 
-PORT = 8080
+PORT = int(os.environ.get("PORT", 8080))
 
 
 # =============================================================
@@ -762,7 +762,7 @@ if __name__ == "__main__":
     print(f"    {TRADE_LOG_FILE} {'✔ encontrado' if os.path.exists(TRADE_LOG_FILE) else '— esperando trades'}")
     print(f"    {BOT_LOG_FILE}   {'✔ encontrado' if os.path.exists(BOT_LOG_FILE) else '— bot no iniciado aún'}\n")
 
-    server = http.server.HTTPServer(("localhost", PORT), Handler)
+    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
