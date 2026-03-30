@@ -132,15 +132,15 @@ class LearningSystem:
         p     = self.data["params"]
         adj   = []
         log.info("[APRENDIZAJE] Win rate: %.1f%% en %d trades.", wr * 100, total)
-        if wr < 0.40 and p["min_score"] < 5:
+        if wr < 0.45 and p["min_score"] < 5:
             p["min_score"] = min(p["min_score"] + 1, 5); adj.append("min_score up")
-        elif wr > 0.65 and p["min_score"] > 2:
+        elif wr > 0.60 and p["min_score"] > 2:
             p["min_score"] = max(p["min_score"] - 1, 2); adj.append("min_score down")
-        if wr < 0.45:
+        if wr < 0.50:
             p["rsi_oversold"]   = max(25, p["rsi_oversold"] - 2)
             p["rsi_overbought"] = min(75, p["rsi_overbought"] + 2)
             adj.append("RSI stricter")
-        elif wr > 0.60:
+        elif wr > 0.55:
             p["rsi_oversold"]   = min(35, p["rsi_oversold"] + 1)
             p["rsi_overbought"] = max(65, p["rsi_overbought"] - 1)
             adj.append("RSI looser")
@@ -149,9 +149,9 @@ class LearningSystem:
             "adjustments": adj, "new_params": dict(p),
         })
         if adj:
+            self.data["last_adjusted"] = datetime.now().isoformat()
             log.info("[APRENDIZAJE] Ajustes: %s", ", ".join(adj))
         self._save()
- 
     def get_best_symbols(self):
         stats  = self.data["symbol_stats"]
         ranked = []
