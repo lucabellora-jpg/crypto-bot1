@@ -1,1 +1,1 @@
-web: python bot.py
+web: python crypto-bot1/main.py
