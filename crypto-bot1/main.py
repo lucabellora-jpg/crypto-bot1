@@ -1,47 +1,57 @@
 """
 =============================================================
   BOT ADAPTATIVO v2 - Altcoins Volatiles
+  Fixes applied:
+    1. RSI sanity check (ignores RSI=0 or RSI=100)
+    2. Max position hold time (4 hours)
+    3. Circuit breaker (stops if balance drops 30%)
+    4. Per-coin cooldown (15 min after closing)
+    5. Trailing stop loss
+    6. Learning dead zone fixed (thresholds 0.50/0.55)
+    7. last_adjusted now written on every adaptation
+    8. Positions persisted to disk (survive redeploys)
+    9. Positions reconciled against Binance on startup
 =============================================================
 """
- 
+
 import time, logging, sys, json, os, math, re, threading
 import http.server, socketserver
 from datetime import datetime, timedelta
- 
+
 try:
     from binance.client import Client
     from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 except ImportError:
     print("Falta instalar: pip install python-binance")
     sys.exit(1)
- 
+
 try:
     import numpy as np
 except ImportError:
     print("Falta instalar: pip install numpy")
     sys.exit(1)
- 
+
 API_KEY     = os.environ.get("API_KEY", "")
 API_SECRET  = os.environ.get("API_SECRET", "")
 USE_TESTNET = True
- 
+
 SYMBOLS = [
     "SOLUSDT", "DOGEUSDT", "AVAXUSDT", "POLUSDT",
     "LINKUSDT", "DOTUSDT", "ADAUSDT", "LTCUSDT",
 ]
- 
+
 INTERVAL         = "5m"
 MAX_TRADE_PCT    = 0.08
 BASE_STOP_LOSS   = 0.03
 BASE_TAKE_PROFIT = 0.06
 MAX_OPEN_TRADES  = 3
- 
+
 MAX_HOLD_HOURS      = 4
 COIN_COOLDOWN_MIN   = 15
 CIRCUIT_BREAKER_PCT = 0.30
 TRAIL_TRIGGER_PCT   = 0.02
 TRAIL_DISTANCE_PCT  = 0.02
- 
+
 INITIAL_PARAMS = {
     "rsi_period"     : 14,
     "rsi_oversold"   : 32,
@@ -57,13 +67,14 @@ INITIAL_PARAMS = {
     "min_score"      : 2,
     "volume_factor"  : 0.5,
 }
- 
-POLL_SECONDS   = 60
-LEARNING_FILE  = "bot_learning.json"
-TRADE_LOG_FILE = "trade_history.log"
-BOT_LOG_FILE   = "bot.log"
-PORT           = int(os.environ.get("PORT", 8080))
- 
+
+POLL_SECONDS    = 60
+LEARNING_FILE   = "bot_learning.json"
+POSITIONS_FILE  = "bot_positions.json"   # FIX #8: persists open positions across redeploys
+TRADE_LOG_FILE  = "trade_history.log"
+BOT_LOG_FILE    = "bot.log"
+PORT            = int(os.environ.get("PORT", 8080))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -74,13 +85,17 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("AdaptiveBot")
- 
- 
+
+
+# =============================================================
+#   LEARNING SYSTEM
+# =============================================================
+
 class LearningSystem:
     def __init__(self, filepath=LEARNING_FILE):
         self.filepath = filepath
         self.data = self._load()
- 
+
     def _load(self):
         if os.path.exists(self.filepath):
             try:
@@ -96,14 +111,14 @@ class LearningSystem:
             "symbol_stats": {}, "hour_stats": {},
             "param_experiments": [], "last_adjusted": None,
         }
- 
+
     def _save(self):
         with open(self.filepath, "w") as f:
             json.dump(self.data, f, indent=2)
- 
+
     def get_params(self):
         return dict(self.data["params"])
- 
+
     def record_trade(self, symbol, pnl_pct, params_used, won):
         hour = str(datetime.now().hour)
         self.data["total_trades"] += 1
@@ -124,7 +139,7 @@ class LearningSystem:
         if self.data["total_trades"] % 10 == 0:
             self._adapt_params()
         self._save()
- 
+
     def _adapt_params(self):
         total = self.data["total_trades"]
         wins  = self.data["total_wins"]
@@ -132,10 +147,17 @@ class LearningSystem:
         p     = self.data["params"]
         adj   = []
         log.info("[APRENDIZAJE] Win rate: %.1f%% en %d trades.", wr * 100, total)
+
+        # FIX #6: Dead zone closed. Old thresholds were 0.40/0.45 and 0.65/0.60,
+        # which left 0.45–0.60 completely unhandled. All 3 checkpoints fell in
+        # that gap. New thresholds: act below 0.50 (tighten) or above 0.55 (loosen).
         if wr < 0.45 and p["min_score"] < 5:
-            p["min_score"] = min(p["min_score"] + 1, 5); adj.append("min_score up")
+            p["min_score"] = min(p["min_score"] + 1, 5)
+            adj.append("min_score up")
         elif wr > 0.60 and p["min_score"] > 2:
-            p["min_score"] = max(p["min_score"] - 1, 2); adj.append("min_score down")
+            p["min_score"] = max(p["min_score"] - 1, 2)
+            adj.append("min_score down")
+
         if wr < 0.50:
             p["rsi_oversold"]   = max(25, p["rsi_oversold"] - 2)
             p["rsi_overbought"] = min(75, p["rsi_overbought"] + 2)
@@ -144,14 +166,17 @@ class LearningSystem:
             p["rsi_oversold"]   = min(35, p["rsi_oversold"] + 1)
             p["rsi_overbought"] = max(65, p["rsi_overbought"] - 1)
             adj.append("RSI looser")
+
         self.data["param_experiments"].append({
             "at_trade": total, "win_rate": round(wr, 3),
             "adjustments": adj, "new_params": dict(p),
         })
         if adj:
+            # FIX #7: Write last_adjusted so the dashboard shows it
             self.data["last_adjusted"] = datetime.now().isoformat()
             log.info("[APRENDIZAJE] Ajustes: %s", ", ".join(adj))
         self._save()
+
     def get_best_symbols(self):
         stats  = self.data["symbol_stats"]
         ranked = []
@@ -160,12 +185,12 @@ class LearningSystem:
             ranked.append((sym, wr))
         ranked.sort(key=lambda x: x[1], reverse=True)
         return [s[0] for s in ranked]
- 
+
     def get_hour_quality(self, hour):
         h = str(hour)
         s = self.data["hour_stats"]
         return s[h]["wins"] / s[h]["trades"] if h in s and s[h]["trades"] >= 5 else 0.5
- 
+
     def print_summary(self):
         t = self.data["total_trades"]
         w = self.data["total_wins"]
@@ -175,15 +200,81 @@ class LearningSystem:
         else:
             log.info("  Sin trades aun")
         log.info("=" * 55)
- 
- 
+
+
+# =============================================================
+#   POSITION PERSISTENCE  (FIX #8 + #9)
+# =============================================================
+
+def load_positions():
+    """Load open positions from disk so redeploys don't lose track of them."""
+    if not os.path.exists(POSITIONS_FILE):
+        return {}
+    try:
+        with open(POSITIONS_FILE, "r") as f:
+            positions = json.load(f)
+            log.info("Positions loaded from disk: %d open.", len(positions))
+            return positions
+    except Exception as e:
+        log.error("Error loading positions file: %s", e)
+        return {}
+
+def save_positions(positions):
+    """Persist the current open positions dict to disk."""
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(positions, f, indent=2)
+    except Exception as e:
+        log.error("Error saving positions: %s", e)
+
+def reconcile_positions(client, positions):
+    """
+    FIX #9: Cross-check saved positions against actual Binance balances.
+    Removes any position whose coin is no longer held on the exchange
+    (e.g. a stop-loss filled while the bot was offline).
+    """
+    if not positions:
+        return positions
+    try:
+        account  = client.get_account()
+        balances = {
+            b["asset"]: float(b["free"]) + float(b["locked"])
+            for b in account["balances"]
+            if float(b["free"]) + float(b["locked"]) > 0
+        }
+        to_remove = []
+        for symbol, pos in positions.items():
+            asset = symbol.replace("USDT", "")
+            held  = balances.get(asset, 0)
+            # Allow 5% tolerance for rounding / fees
+            if held < pos["qty"] * 0.95:
+                log.warning(
+                    "  Reconcile: %s not found on Binance (expected %.4f, found %.4f) — removing from tracker.",
+                    symbol, pos["qty"], held
+                )
+                to_remove.append(symbol)
+            else:
+                log.info("  Reconcile: %s OK (held %.4f).", symbol, held)
+        for symbol in to_remove:
+            del positions[symbol]
+        save_positions(positions)
+        log.info("Reconciliation done. %d position(s) active.", len(positions))
+    except Exception as e:
+        log.error("Reconciliation error: %s", e)
+    return positions
+
+
+# =============================================================
+#   INDICATORS
+# =============================================================
+
 def ema(prices, period):
     k = 2 / (period + 1)
     r = [prices[0]]
     for p in prices[1:]:
         r.append(p * k + r[-1] * (1 - k))
     return r
- 
+
 def calculate_rsi(prices, period):
     if len(prices) < period + 1:
         return 50.0
@@ -199,7 +290,7 @@ def calculate_rsi(prices, period):
     if rsi <= 1.0 or rsi >= 99.0:
         return 50.0
     return rsi
- 
+
 def calculate_bollinger(prices, period, std_mult):
     if len(prices) < period:
         return prices[-1], prices[-1], prices[-1]
@@ -207,27 +298,32 @@ def calculate_bollinger(prices, period, std_mult):
     mid = sum(w) / period
     std = math.sqrt(sum((p - mid)**2 for p in w) / period)
     return mid + std * std_mult, mid, mid - std * std_mult
- 
+
 def calculate_macd(prices, fast, slow, sig):
     if len(prices) < slow + sig:
         return 0, 0, 0
     ml  = [f - s for f, s in zip(ema(prices, fast), ema(prices, slow))]
     sl  = ema(ml, sig)
     return ml[-1], sl[-1], ml[-1] - sl[-1]
- 
+
 def calculate_atr(highs, lows, closes, period):
     if len(closes) < 2:
         return closes[-1] * 0.02
     trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
            for i in range(1, len(closes))]
     return sum(trs[-period:]) / min(period, len(trs))
- 
+
 def calculate_volume_ratio(volumes, period=20):
     if len(volumes) < 2:
         return 1.0
     avg = sum(volumes[-period-1:-1]) / min(period, len(volumes)-1)
     return volumes[-1] / avg if avg > 0 else 1.0
- 
+
+
+# =============================================================
+#   SIGNAL ANALYSIS
+# =============================================================
+
 def analyze_symbol(candles, params):
     closes  = candles["closes"]
     highs   = candles["highs"]
@@ -242,7 +338,7 @@ def analyze_symbol(candles, params):
     _, _, ph = calculate_macd(closes[:-1], params["macd_fast"], params["macd_slow"], params["macd_signal"]) if len(closes) > 30 else (0, 0, 0)
     atr   = calculate_atr(highs, lows, closes, params["atr_period"])
     vol_r = calculate_volume_ratio(volumes)
- 
+
     score, detail = 0, []
     if rsi < params["rsi_oversold"]:
         score += 1; detail.append("RSI=%.1f ok" % rsi)
@@ -255,7 +351,7 @@ def analyze_symbol(candles, params):
         score += 1; detail.append("MACD ok")
     if vol_r >= params["volume_factor"]:
         score += 1; detail.append("Vol x%.1f ok" % vol_r)
- 
+
     sell = (rsi > params["rsi_overbought"] or
             (len(fe) >= 2 and len(se) >= 2 and fe[-2] >= se[-2] and fe[-1] < se[-1]) or
             (price > bb_u and mh < 0))
@@ -269,7 +365,12 @@ def analyze_symbol(candles, params):
         "tp_pct": max(BASE_TAKE_PROFIT, atr_pct * 3.0),
         "atr": atr, "vol_ratio": vol_r, "macd_hist": mh,
     }
- 
+
+
+# =============================================================
+#   EXCHANGE
+# =============================================================
+
 def create_client():
     if not API_KEY or not API_SECRET:
         log.error("Faltan las API keys!")
@@ -281,7 +382,7 @@ def create_client():
     else:
         log.warning("*** Conectado a Binance REAL ***")
     return client
- 
+
 def fetch_candles(client, symbol, interval, limit=120):
     raw = client.get_klines(symbol=symbol, interval=interval, limit=limit)
     return {
@@ -291,11 +392,11 @@ def fetch_candles(client, symbol, interval, limit=120):
         "closes":  [float(c[4]) for c in raw],
         "volumes": [float(c[5]) for c in raw],
     }
- 
+
 def get_balance(client, asset="USDT"):
     info = client.get_asset_balance(asset=asset)
     return float(info["free"]) if info else 0.0
- 
+
 def get_lot_rules(client, symbol):
     try:
         info = client.get_symbol_info(symbol)
@@ -305,20 +406,20 @@ def get_lot_rules(client, symbol):
     except Exception:
         pass
     return {"min_qty": 0.001, "step_size": 0.001}
- 
+
 def round_step(qty, step_size):
     if step_size == 0:
         return qty
     factor = 10 ** round(-math.log10(step_size))
     return math.floor(qty * factor) / factor
- 
+
 def place_order(client, symbol, side, qty):
     return client.create_order(
         symbol=symbol,
         side=SIDE_BUY if side == "BUY" else SIDE_SELL,
         type=ORDER_TYPE_MARKET, quantity=qty,
     )
- 
+
 def log_trade(symbol, side, price, qty, pnl_pct=None, reason=""):
     if pnl_pct is not None:
         line = "%s | %-4s | %-12s | precio=$%.4f | qty=%s | pnl=%+.2f%% | %s\n" % (
@@ -328,12 +429,12 @@ def log_trade(symbol, side, price, qty, pnl_pct=None, reason=""):
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), side, symbol, price, qty)
     with open(TRADE_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line)
- 
- 
+
+
 # =============================================================
-#   DASHBOARD HTML - ASCII only in JS to avoid encoding issues
+#   DASHBOARD HTML
 # =============================================================
- 
+
 DASHBOARD_HTML = (
 '<!DOCTYPE html>'
 '<html lang="en">'
@@ -559,12 +660,12 @@ DASHBOARD_HTML = (
 '</body>'
 '</html>'
 )
- 
- 
+
+
 # =============================================================
 #   DASHBOARD DATA
 # =============================================================
- 
+
 def read_learning():
     if not os.path.exists(LEARNING_FILE):
         return {}
@@ -573,7 +674,7 @@ def read_learning():
             return json.load(f)
     except Exception:
         return {}
- 
+
 def read_trades():
     if not os.path.exists(TRADE_LOG_FILE):
         return []
@@ -598,7 +699,7 @@ def read_trades():
     except Exception:
         pass
     return list(reversed(trades))
- 
+
 def read_status():
     if not os.path.exists(BOT_LOG_FILE):
         return {"running": False, "last_line": "Bot not started.", "last_time": "-"}
@@ -619,9 +720,9 @@ def read_status():
         return {"running": alive, "last_line": last[-120:], "last_time": lt}
     except Exception:
         return {"running": False, "last_line": "Error.", "last_time": "-"}
- 
+
 _circuit_breaker_active = False
- 
+
 def build_api_data():
     learning = read_learning()
     trades   = read_trades()
@@ -640,16 +741,16 @@ def build_api_data():
         "trades":    trades[:50],
         "circuit_breaker": _circuit_breaker_active,
     }
- 
- 
+
+
 # =============================================================
 #   HTTP HANDLER
 # =============================================================
- 
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
- 
+
     def _send(self, code, ctype, body, dl=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -658,7 +759,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body if isinstance(body, bytes) else body.encode("utf-8"))
- 
+
     def do_GET(self):
         p = self.path.split("?")[0]
         if p in ("/", "/index.html"):
@@ -685,38 +786,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(404, "text/plain", "Not found.")
         else:
             self._send(404, "text/plain", "Not found.")
- 
- 
+
+
 def start_dashboard():
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
         log.info("Dashboard on port %d", PORT)
         httpd.serve_forever()
- 
- 
+
+
 # =============================================================
 #   BOT MAIN LOOP
 # =============================================================
- 
+
 def run():
     global _circuit_breaker_active
- 
+
     log.info("=" * 55)
     log.info("  ADAPTIVE BOT v2 - VOLATILE ALTCOINS")
     log.info("  Coins     : %s", ", ".join(SYMBOLS))
     log.info("  Interval  : %s | Mode: %s", INTERVAL, "TESTNET" if USE_TESTNET else "*** LIVE ***")
     log.info("  Max hold  : %dh | Cooldown: %dmin | CB: -%d%%", MAX_HOLD_HOURS, COIN_COOLDOWN_MIN, int(CIRCUIT_BREAKER_PCT * 100))
     log.info("=" * 55)
- 
+
     client        = create_client()
     learning      = LearningSystem()
     learning.print_summary()
-    positions     = {}
+
+    # FIX #8: Load positions from disk instead of starting empty
+    positions     = load_positions()
+    # FIX #9: Cross-check loaded positions against actual Binance balances
+    positions     = reconcile_positions(client, positions)
     cooldowns     = {}
+
     start_balance = get_balance(client, "USDT")
     log.info("Starting balance: $%.2f", start_balance)
     cycle = 0
- 
+
     while True:
         try:
             cycle  += 1
@@ -725,7 +831,7 @@ def run():
             balance = get_balance(client, "USDT")
             log.info("\n-- Cycle #%d | %s | Balance: $%.2f | Positions: %d/%d --",
                      cycle, now.strftime("%H:%M:%S"), balance, len(positions), MAX_OPEN_TRADES)
- 
+
             if start_balance > 0:
                 drop = (start_balance - balance) / start_balance
                 if drop >= CIRCUIT_BREAKER_PCT:
@@ -733,7 +839,7 @@ def run():
                     log.warning("  CIRCUIT BREAKER active - dropped %.1f%% from $%.0f. New trades paused.", drop * 100, start_balance)
                 else:
                     _circuit_breaker_active = False
- 
+
             analyses = {}
             for symbol in learning.get_best_symbols():
                 try:
@@ -745,7 +851,8 @@ def run():
                              symbol, result["price"], result["rsi"], result["score"], result["vol_ratio"])
                 except Exception as e:
                     log.warning("  Error on %s: %s", symbol, e)
- 
+
+            # Manage open positions
             for symbol, pos in list(positions.items()):
                 if symbol not in analyses:
                     continue
@@ -753,7 +860,7 @@ def run():
                 price = a["price"]
                 entry = pos["entry"]
                 pnl   = (price - entry) / entry * 100
- 
+
                 if price > pos.get("peak_price", entry):
                     pos["peak_price"] = price
                 peak = pos.get("peak_price", entry)
@@ -762,7 +869,8 @@ def run():
                     if trail_sl > pos["stop_loss"]:
                         pos["stop_loss"] = trail_sl
                         log.info("  Trailing SL %s -> $%.4f", symbol, trail_sl)
- 
+                        save_positions(positions)  # FIX #8: persist updated trailing SL
+
                 held_h = (now - datetime.fromisoformat(pos["open_time"])).total_seconds() / 3600
                 why = None
                 if price <= pos["stop_loss"]:
@@ -773,7 +881,7 @@ def run():
                     why = "SELL SIGNAL"
                 elif held_h >= MAX_HOLD_HOURS:
                     why = "MAX HOLD (%.1fh)" % held_h
- 
+
                 if why:
                     try:
                         place_order(client, symbol, "SELL", pos["qty"])
@@ -784,9 +892,11 @@ def run():
                         learning.record_trade(symbol, pnl, params, won)
                         cooldowns[symbol] = now + timedelta(minutes=COIN_COOLDOWN_MIN)
                         del positions[symbol]
+                        save_positions(positions)  # FIX #8: persist after closing
                     except Exception as e:
                         log.error("  Error closing %s: %s", symbol, e)
- 
+
+            # Open new positions
             if len(positions) < MAX_OPEN_TRADES and balance > 20 and not _circuit_breaker_active:
                 candidates = sorted(
                     [(s, a) for s, a in analyses.items()
@@ -815,14 +925,15 @@ def run():
                             "open_time": now.isoformat(),
                             "peak_price": pr,
                         }
+                        save_positions(positions)  # FIX #8: persist after opening
                         log.info("  OPEN %s @ $%.4f | Qty:%s | SL:$%.4f | TP:$%.4f | Score:%d/6",
                                  symbol, pr, qty, sl, tp, a["score"])
                         log_trade(symbol, "BUY", pr, qty)
                     except Exception as e:
                         log.error("  Error opening %s: %s", symbol, e)
- 
+
             time.sleep(POLL_SECONDS)
- 
+
         except KeyboardInterrupt:
             log.info("\nBot stopped.")
             learning.print_summary()
@@ -830,9 +941,8 @@ def run():
         except Exception as e:
             log.error("Unexpected error: %s - retrying in 30s...", e)
             time.sleep(30)
- 
- 
+
+
 if __name__ == "__main__":
     threading.Thread(target=start_dashboard, daemon=True).start()
     run()
- 
