@@ -158,7 +158,7 @@ class LearningSystem:
             p["min_score"] = max(p["min_score"] - 1, 2)
             adj.append("min_score down")
 
-        if wr < 0.50:
+        if wr <= 0.50:
             p["rsi_oversold"]   = max(25, p["rsi_oversold"] - 2)
             p["rsi_overbought"] = min(75, p["rsi_overbought"] + 2)
             adj.append("RSI stricter")
