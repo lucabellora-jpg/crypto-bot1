@@ -355,13 +355,15 @@ def analyze_symbol(candles, params):
             (len(fe) >= 2 and len(se) >= 2 and fe[-2] >= se[-2] and fe[-1] < se[-1]) or
             (price > bb_u and mh < 0))
     atr_pct = atr / price
+    if len(set(closes[-5:])) == 1:
+        return None
     return {
         "price": price, "rsi": rsi, "score": score,
         "buy_signal": score >= params["min_score"],
         "sell_signal": sell,
         "detail": detail,
         "sl_pct": max(BASE_STOP_LOSS, atr_pct * 1.5),
-        "tp_pct": max(BASE_TAKE_PROFIT, atr_pct * 4.5),
+        "tp_pct": max(BASE_TAKE_PROFIT, atr_pct * 3.0),
         "atr": atr, "vol_ratio": vol_r, "macd_hist": mh,
     }
 
@@ -844,6 +846,9 @@ def run():
                 try:
                     candles = fetch_candles(client, symbol, INTERVAL)
                     result  = analyze_symbol(candles, params)
+                    if result is None:
+                        log.warning("  %s: candles congelados, saltando.", symbol)
+                        continue
                     result["hour_q"] = learning.get_hour_quality(now.hour)
                     analyses[symbol] = result
                     log.info("  %-12s $%10.4f | RSI=%5.1f | Score=%d/6 | Vol x%.1f",
