@@ -762,38 +762,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body if isinstance(body, bytes) else body.encode("utf-8"))
 
     def do_GET(self):
-        p = self.path.split("?")[0]
-        if p in ("/", "/index.html"):
-            self._send(200, "text/html; charset=utf-8", DASHBOARD_HTML)
-        elif p == "/api/data":
-            self._send(200, "application/json", json.dumps(build_api_data()))
-        elif p == "/api/learning":
-            if os.path.exists(LEARNING_FILE):
-                with open(LEARNING_FILE) as f:
-                    self._send(200, "application/json", f.read(), "bot_learning.json")
-            else:
-                self._send(404, "text/plain", "Not available yet.")
-        elif p == "/api/trades":
-            if os.path.exists(TRADE_LOG_FILE):
-                with open(TRADE_LOG_FILE, encoding="utf-8") as f:
-                    self._send(200, "text/plain", f.read(), "trade_history.log")
-            else:
-                self._send(404, "text/plain", "No trades yet.")
-        elif p == "/api/logs":
-            if os.path.exists(BOT_LOG_FILE):
-                with open(BOT_LOG_FILE, encoding="utf-8") as f:
-                    self._send(200, "text/plain", f.read()[-50000:], "bot.log")
-        elif p == "/api/reset":
-    for f in ["bot_learning.json", "bot_positions.json", "trade_history.log"]:
-        if os.path.exists(f):
-            os.remove(f)
-            log.info("Reset: %s eliminado.", f)
-    self._send(200, "application/json", json.dumps({"ok": True}))
-  
-            else:
-                self._send(404, "text/plain", "Not found.")
+    p = self.path.split("?")[0]
+    if p in ("/", "/index.html"):
+        self._send(200, "text/html; charset=utf-8", DASHBOARD_HTML)
+    elif p == "/api/data":
+        self._send(200, "application/json", json.dumps(build_api_data()))
+    elif p == "/api/learning":
+        if os.path.exists(LEARNING_FILE):
+            with open(LEARNING_FILE) as f:
+                self._send(200, "application/json", f.read(), "bot_learning.json")
+        else:
+            self._send(404, "text/plain", "Not available yet.")
+    elif p == "/api/trades":
+        if os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE, encoding="utf-8") as f:
+                self._send(200, "text/plain", f.read(), "trade_history.log")
+        else:
+            self._send(404, "text/plain", "No trades yet.")
+    elif p == "/api/logs":
+        if os.path.exists(BOT_LOG_FILE):
+            with open(BOT_LOG_FILE, encoding="utf-8") as f:
+                self._send(200, "text/plain", f.read()[-50000:], "bot.log")
         else:
             self._send(404, "text/plain", "Not found.")
+    elif p == "/api/reset":
+        for f in ["bot_learning.json", "bot_positions.json", "trade_history.log"]:
+            if os.path.exists(f):
+                os.remove(f)
+                log.info("Reset: %s eliminado.", f)
+        self._send(200, "application/json", json.dumps({"ok": True}))
+    else:
+        self._send(404, "text/plain", "Not found.")
 
 
 def start_dashboard():
