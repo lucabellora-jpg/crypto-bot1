@@ -783,6 +783,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if os.path.exists(BOT_LOG_FILE):
                 with open(BOT_LOG_FILE, encoding="utf-8") as f:
                     self._send(200, "text/plain", f.read()[-50000:], "bot.log")
+        elif p == "/api/reset":
+    for f in ["bot_learning.json", "bot_positions.json", "trade_history.log"]:
+        if os.path.exists(f):
+            os.remove(f)
+            log.info("Reset: %s eliminado.", f)
+    self._send(200, "application/json", json.dumps({"ok": True}))
+  
             else:
                 self._send(404, "text/plain", "Not found.")
         else:
