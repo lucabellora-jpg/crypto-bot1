@@ -902,9 +902,13 @@ def run():
                         learning.record_trade(symbol, pnl, params, won)
                         cooldowns[symbol] = now + timedelta(minutes=COIN_COOLDOWN_MIN)
                         del positions[symbol]
-                        save_positions(positions)  # FIX #8: persist after closing
+                        save_positions(positions)
                     except Exception as e:
                         log.error("  Error closing %s: %s", symbol, e)
+                        if "-2010" in str(e):
+                            log.warning("  %s: balance insuficiente — eliminando de tracking.", symbol)
+                            del positions[symbol]
+                            save_positions(positions)
 
             # Open new positions
             if len(positions) < MAX_OPEN_TRADES and balance > 20 and not _circuit_breaker_active:
