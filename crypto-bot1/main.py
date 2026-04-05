@@ -226,10 +226,6 @@ def save_positions(positions):
         log.error("Error guardando posiciones: %s", e)
 
 def reconcile_positions(client, positions):
-    """
-    Cruza las posiciones guardadas con los balances reales de Binance.
-    Elimina cualquier posicion cuya moneda ya no este en la cuenta.
-    """
     if not positions:
         return positions
     try:
@@ -243,7 +239,7 @@ def reconcile_positions(client, positions):
         for symbol, pos in positions.items():
             asset = symbol.replace("USDT", "")
             held  = balances.get(asset, 0)
-                       qty_tracked = float(pos["qty"])
+            qty_tracked = float(pos["qty"])
             if held < qty_tracked * 0.95:
                 log.warning(
                     "  Reconcile: %s no encontrado en Binance (esperado %.4f, encontrado %.4f) — eliminando.",
