@@ -243,18 +243,17 @@ def reconcile_positions(client, positions):
         for symbol, pos in positions.items():
             asset = symbol.replace("USDT", "")
             held  = balances.get(asset, 0)
-            if held < pos["qty"] * 0.95:
-                            if held < pos["qty"] * 0.95:
+                       qty_tracked = float(pos["qty"])
+            if held < qty_tracked * 0.95:
                 log.warning(
                     "  Reconcile: %s no encontrado en Binance (esperado %.4f, encontrado %.4f) — eliminando.",
-                    symbol, pos["qty"], held
+                    symbol, qty_tracked, held
                 )
                 to_remove.append(symbol)
-            elif held > pos["qty"] * 1.05:
-                # Tenemos MAS de lo esperado — actualizar qty al valor real
+            elif held > qty_tracked * 1.05:
                 log.warning(
                     "  Reconcile: %s tiene mas de lo esperado (%.4f vs %.4f) — actualizando qty.",
-                    symbol, held, pos["qty"]
+                    symbol, held, qty_tracked
                 )
                 positions[symbol]["qty"] = held
             else:
