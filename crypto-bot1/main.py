@@ -4,7 +4,7 @@
   Fixes aplicados:
     1. RSI sanity check (ignora RSI=0 o RSI=100)
     2. Tiempo maximo de posicion (4 horas)
-    3. Circuit breaker (15% — resetea correctamente en cada deploy)
+    3. Circuit breaker (25% — resetea correctamente en cada deploy)
     4. Cooldown por moneda (15 min tras cerrar)
     5. Trailing stop loss
     6. Learning dead zone cerrado (thresholds 0.50/0.55)
@@ -52,7 +52,7 @@ MAX_OPEN_TRADES  = 2
 
 MAX_HOLD_HOURS      = 4
 COIN_COOLDOWN_MIN   = 15
-CIRCUIT_BREAKER_PCT = 0.15
+CIRCUIT_BREAKER_PCT = 0.25
 TRAIL_TRIGGER_PCT   = 0.02
 TRAIL_DISTANCE_PCT  = 0.02
 
