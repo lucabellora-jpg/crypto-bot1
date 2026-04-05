@@ -1,16 +1,21 @@
 """
 =============================================================
   BOT ADAPTATIVO v2 - Altcoins Volatiles
-  Fixes applied:
-    1. RSI sanity check (ignores RSI=0 or RSI=100)
-    2. Max position hold time (4 hours)
-    3. Circuit breaker (stops if balance drops 30%)
-    4. Per-coin cooldown (15 min after closing)
+  Fixes aplicados:
+    1. RSI sanity check (ignora RSI=0 o RSI=100)
+    2. Tiempo maximo de posicion (4 horas)
+    3. Circuit breaker (15% — resetea correctamente en cada deploy)
+    4. Cooldown por moneda (15 min tras cerrar)
     5. Trailing stop loss
-    6. Learning dead zone fixed (thresholds 0.50/0.55)
-    7. last_adjusted now written on every adaptation
-    8. Positions persisted to disk (survive redeploys)
-    9. Positions reconciled against Binance on startup
+    6. Learning dead zone cerrado (thresholds 0.50/0.55)
+    7. last_adjusted se escribe en cada adaptacion
+    8. Posiciones persistidas en disco (sobreviven redeploys)
+    9. Reconciliacion de posiciones contra Binance al arrancar
+   10. Deteccion de candles congelados (RSI=50 fijo)
+   11. Validacion notional minimo ($6 por orden)
+   12. Error -2010 auto-elimina posicion fantasma
+   13. Endpoint /api/reset para limpiar archivos desde browser
+   14. Circuit breaker NO acumula entre sesiones (usa balance real al arrancar)
 =============================================================
 """
 
@@ -33,7 +38,7 @@ except ImportError:
 
 API_KEY     = os.environ.get("API_KEY", "")
 API_SECRET  = os.environ.get("API_SECRET", "")
-USE_TESTNET = False 
+USE_TESTNET = False
 
 SYMBOLS = [
     "SOLUSDT", "DOGEUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT",
@@ -41,20 +46,20 @@ SYMBOLS = [
 
 INTERVAL         = "5m"
 MAX_TRADE_PCT    = 0.12
-BASE_STOP_LOSS   = 0.03
-BASE_TAKE_PROFIT = 0.06
+BASE_STOP_LOSS   = 0.025
+BASE_TAKE_PROFIT = 0.055
 MAX_OPEN_TRADES  = 2
 
 MAX_HOLD_HOURS      = 4
 COIN_COOLDOWN_MIN   = 15
-CIRCUIT_BREAKER_PCT = 0.25
+CIRCUIT_BREAKER_PCT = 0.15
 TRAIL_TRIGGER_PCT   = 0.02
 TRAIL_DISTANCE_PCT  = 0.02
 
 INITIAL_PARAMS = {
     "rsi_period"     : 14,
-    "rsi_oversold"   : 32,
-    "rsi_overbought" : 68,
+    "rsi_oversold"   : 30,
+    "rsi_overbought" : 70,
     "fast_ema"       : 9,
     "slow_ema"       : 21,
     "bb_period"      : 20,
@@ -63,13 +68,13 @@ INITIAL_PARAMS = {
     "macd_slow"      : 26,
     "macd_signal"    : 9,
     "atr_period"     : 14,
-    "min_score"      : 2,
-    "volume_factor"  : 0.5,
+    "min_score"      : 3,
+    "volume_factor"  : 1.2,
 }
 
 POLL_SECONDS    = 60
 LEARNING_FILE   = "bot_learning.json"
-POSITIONS_FILE  = "bot_positions.json"   # FIX #8: persists open positions across redeploys
+POSITIONS_FILE  = "bot_positions.json"
 TRADE_LOG_FILE  = "trade_history.log"
 BOT_LOG_FILE    = "bot.log"
 PORT            = int(os.environ.get("PORT", 8080))
@@ -147,9 +152,6 @@ class LearningSystem:
         adj   = []
         log.info("[APRENDIZAJE] Win rate: %.1f%% en %d trades.", wr * 100, total)
 
-        # FIX #6: Dead zone closed. Old thresholds were 0.40/0.45 and 0.65/0.60,
-        # which left 0.45–0.60 completely unhandled. All 3 checkpoints fell in
-        # that gap. New thresholds: act below 0.50 (tighten) or above 0.55 (loosen).
         if wr < 0.45 and p["min_score"] < 5:
             p["min_score"] = min(p["min_score"] + 1, 5)
             adj.append("min_score up")
@@ -171,7 +173,6 @@ class LearningSystem:
             "adjustments": adj, "new_params": dict(p),
         })
         if adj:
-            # FIX #7: Write last_adjusted so the dashboard shows it
             self.data["last_adjusted"] = datetime.now().isoformat()
             log.info("[APRENDIZAJE] Ajustes: %s", ", ".join(adj))
         self._save()
@@ -202,35 +203,32 @@ class LearningSystem:
 
 
 # =============================================================
-#   POSITION PERSISTENCE  (FIX #8 + #9)
+#   POSITION PERSISTENCE
 # =============================================================
 
 def load_positions():
-    """Load open positions from disk so redeploys don't lose track of them."""
     if not os.path.exists(POSITIONS_FILE):
         return {}
     try:
         with open(POSITIONS_FILE, "r") as f:
             positions = json.load(f)
-            log.info("Positions loaded from disk: %d open.", len(positions))
+            log.info("Posiciones cargadas: %d abiertas.", len(positions))
             return positions
     except Exception as e:
-        log.error("Error loading positions file: %s", e)
+        log.error("Error cargando posiciones: %s", e)
         return {}
 
 def save_positions(positions):
-    """Persist the current open positions dict to disk."""
     try:
         with open(POSITIONS_FILE, "w") as f:
             json.dump(positions, f, indent=2)
     except Exception as e:
-        log.error("Error saving positions: %s", e)
+        log.error("Error guardando posiciones: %s", e)
 
 def reconcile_positions(client, positions):
     """
-    FIX #9: Cross-check saved positions against actual Binance balances.
-    Removes any position whose coin is no longer held on the exchange
-    (e.g. a stop-loss filled while the bot was offline).
+    Cruza las posiciones guardadas con los balances reales de Binance.
+    Elimina cualquier posicion cuya moneda ya no este en la cuenta.
     """
     if not positions:
         return positions
@@ -245,21 +243,20 @@ def reconcile_positions(client, positions):
         for symbol, pos in positions.items():
             asset = symbol.replace("USDT", "")
             held  = balances.get(asset, 0)
-            # Allow 5% tolerance for rounding / fees
             if held < pos["qty"] * 0.95:
                 log.warning(
-                    "  Reconcile: %s not found on Binance (expected %.4f, found %.4f) — removing from tracker.",
+                    "  Reconcile: %s no encontrado en Binance (esperado %.4f, encontrado %.4f) — eliminando.",
                     symbol, pos["qty"], held
                 )
                 to_remove.append(symbol)
             else:
-                log.info("  Reconcile: %s OK (held %.4f).", symbol, held)
+                log.info("  Reconcile: %s OK (%.4f en cuenta).", symbol, held)
         for symbol in to_remove:
             del positions[symbol]
         save_positions(positions)
-        log.info("Reconciliation done. %d position(s) active.", len(positions))
+        log.info("Reconciliacion lista. %d posicion(es) activa(s).", len(positions))
     except Exception as e:
-        log.error("Reconciliation error: %s", e)
+        log.error("Error en reconciliacion: %s", e)
     return positions
 
 
@@ -329,6 +326,11 @@ def analyze_symbol(candles, params):
     lows    = candles["lows"]
     volumes = candles["volumes"]
     price   = closes[-1]
+
+    # FIX: Detectar candles congelados — si los ultimos 5 cierres son identicos, skip
+    if len(set(closes[-5:])) == 1:
+        return None
+
     rsi     = calculate_rsi(closes, params["rsi_period"])
     fe      = ema(closes, params["fast_ema"])
     se      = ema(closes, params["slow_ema"])
@@ -355,15 +357,13 @@ def analyze_symbol(candles, params):
             (len(fe) >= 2 and len(se) >= 2 and fe[-2] >= se[-2] and fe[-1] < se[-1]) or
             (price > bb_u and mh < 0))
     atr_pct = atr / price
-    if len(set(closes[-5:])) == 1:
-        return None
     return {
         "price": price, "rsi": rsi, "score": score,
         "buy_signal": score >= params["min_score"],
         "sell_signal": sell,
         "detail": detail,
         "sl_pct": max(BASE_STOP_LOSS, atr_pct * 1.5),
-        "tp_pct": max(BASE_TAKE_PROFIT, atr_pct * 3.0),
+        "tp_pct": max(BASE_TAKE_PROFIT, atr_pct * 4.5),
         "atr": atr, "vol_ratio": vol_r, "macd_hist": mh,
     }
 
@@ -505,7 +505,7 @@ DASHBOARD_HTML = (
 '<div class="metrics">'
 '<div class="mcard"><div class="mlabel">Total trades</div><div class="mval" id="m1" style="color:var(--blu)">0</div><div class="msub" id="m1s">0W / 0L</div></div>'
 '<div class="mcard"><div class="mlabel">Win rate</div><div class="mval" id="m2">0%</div><div class="wr-bar"><div class="wr-fill" id="wrb" style="width:0%"></div></div></div>'
-'<div class="mcard"><div class="mlabel">PnL acumulado</div><div class="mval" id="m3">0.00%</div><div class="msub">todos los trades cerrados</div></div>'
+'<div class="mcard"><div class="mlabel">PnL acumulado</div><div class="mval" id="m3">0.00%</div><div class="msub">trades cerrados esta sesion</div></div>'
 '<div class="mcard"><div class="mlabel">Ultimo ajuste</div><div class="mval" id="m4" style="color:var(--amb);font-size:16px">-</div><div class="msub" id="m4s">auto learning</div></div>'
 '</div>'
 '<div class="card"><div class="sec">Last log line</div><div class="logline" id="logline">Waiting...</div></div>'
@@ -520,6 +520,12 @@ DASHBOARD_HTML = (
 '<a class="dl-btn" href="/api/learning" download="bot_learning.json">bot_learning.json</a>'
 '<a class="dl-btn" href="/api/trades" download="trade_history.log">trade_history.log</a>'
 '<a class="dl-btn" href="/api/logs" download="bot.log">bot.log</a>'
+'<div style="margin-top:1.5rem">'
+'<div class="sec">Reset all bot data</div>'
+'<p style="font-size:12px;color:var(--mut);margin-bottom:.75rem">Clears positions, learning and trade history. Use only after manually selling all coins on Binance.</p>'
+'<button class="copy-btn" style="background:var(--red)" onclick="doReset()">Reset all files</button>'
+'<div id="reset-msg" style="font-size:12px;margin-top:8px;color:var(--grn)"></div>'
+'</div>'
 '<div style="margin-top:1.5rem">'
 '<div class="sec">Copy learning data</div>'
 '<div class="copy-area" id="json-preview">Loading...</div>'
@@ -555,6 +561,12 @@ DASHBOARD_HTML = (
 '    b.textContent = "Copied!";'
 '    setTimeout(function() { b.textContent = "Copy to clipboard"; }, 2000);'
 '  });'
+'}'
+'function doReset() {'
+'  if (!confirm("This will delete all position and learning data. Make sure you have sold everything on Binance first!")) return;'
+'  fetch("/api/reset").then(function(r) { return r.json(); }).then(function(d) {'
+'    document.getElementById("reset-msg").textContent = d.ok ? "Reset successful. Restart the bot now." : "Reset failed.";'
+'  }).catch(function() { document.getElementById("reset-msg").textContent = "Error calling reset."; });'
 '}'
 'function fmtNum(n, dec) {'
 '  if (n === null || n === undefined || n === "") { return "-"; }'
@@ -786,11 +798,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send(404, "text/plain", "Not found.")
         elif p == "/api/reset":
-            for f in ["bot_learning.json", "bot_positions.json", "trade_history.log"]:
+            # FIX: endpoint de reset accesible desde el browser
+            for f in [LEARNING_FILE, POSITIONS_FILE, TRADE_LOG_FILE]:
                 if os.path.exists(f):
                     os.remove(f)
                     log.info("Reset: %s eliminado.", f)
-            self._send(200, "application/json", json.dumps({"ok": True}))
+            self._send(200, "application/json", json.dumps({"ok": True, "msg": "Reset done. Restart the bot now."}))
         else:
             self._send(404, "text/plain", "Not found.")
 
@@ -816,18 +829,20 @@ def run():
     log.info("  Max hold  : %dh | Cooldown: %dmin | CB: -%d%%", MAX_HOLD_HOURS, COIN_COOLDOWN_MIN, int(CIRCUIT_BREAKER_PCT * 100))
     log.info("=" * 55)
 
-    client        = create_client()
-    learning      = LearningSystem()
+    client   = create_client()
+    learning = LearningSystem()
     learning.print_summary()
 
-    # FIX #8: Load positions from disk instead of starting empty
-    positions     = load_positions()
-    # FIX #9: Cross-check loaded positions against actual Binance balances
-    positions     = reconcile_positions(client, positions)
-    cooldowns     = {}
+    # Cargar y reconciliar posiciones
+    positions = load_positions()
+    positions = reconcile_positions(client, positions)
+    cooldowns = {}
 
+    # FIX: start_balance siempre se captura del balance REAL en Binance al arrancar
+    # Esto evita que el circuit breaker herede caidas de sesiones anteriores
     start_balance = get_balance(client, "USDT")
-    log.info("Starting balance: $%.2f", start_balance)
+    log.info("Starting balance: $%.2f (circuit breaker se activa si cae a $%.2f)",
+             start_balance, start_balance * (1 - CIRCUIT_BREAKER_PCT))
     cycle = 0
 
     while True:
@@ -839,14 +854,17 @@ def run():
             log.info("\n-- Cycle #%d | %s | Balance: $%.2f | Positions: %d/%d --",
                      cycle, now.strftime("%H:%M:%S"), balance, len(positions), MAX_OPEN_TRADES)
 
+            # Circuit breaker basado en balance USDT libre vs arranque
             if start_balance > 0:
                 drop = (start_balance - balance) / start_balance
                 if drop >= CIRCUIT_BREAKER_PCT:
                     _circuit_breaker_active = True
-                    log.warning("  CIRCUIT BREAKER active - dropped %.1f%% from $%.0f. New trades paused.", drop * 100, start_balance)
+                    log.warning("  CIRCUIT BREAKER active - dropped %.1f%% from $%.0f. New trades paused.",
+                                drop * 100, start_balance)
                 else:
                     _circuit_breaker_active = False
 
+            # Analizar simbolos
             analyses = {}
             for symbol in learning.get_best_symbols():
                 try:
@@ -862,7 +880,7 @@ def run():
                 except Exception as e:
                     log.warning("  Error on %s: %s", symbol, e)
 
-            # Manage open positions
+            # Gestionar posiciones abiertas
             for symbol, pos in list(positions.items()):
                 if symbol not in analyses:
                     continue
@@ -879,7 +897,7 @@ def run():
                     if trail_sl > pos["stop_loss"]:
                         pos["stop_loss"] = trail_sl
                         log.info("  Trailing SL %s -> $%.4f", symbol, trail_sl)
-                        save_positions(positions)  # FIX #8: persist updated trailing SL
+                        save_positions(positions)
 
                 held_h = (now - datetime.fromisoformat(pos["open_time"])).total_seconds() / 3600
                 why = None
@@ -905,12 +923,13 @@ def run():
                         save_positions(positions)
                     except Exception as e:
                         log.error("  Error closing %s: %s", symbol, e)
+                        # FIX: si Binance dice que no hay balance, la posicion es fantasma
                         if "-2010" in str(e):
-                            log.warning("  %s: balance insuficiente — eliminando de tracking.", symbol)
+                            log.warning("  %s: balance insuficiente en Binance — eliminando posicion fantasma.", symbol)
                             del positions[symbol]
                             save_positions(positions)
 
-            # Open new positions
+            # Abrir nuevas posiciones
             if len(positions) < MAX_OPEN_TRADES and balance > 20 and not _circuit_breaker_active:
                 candidates = sorted(
                     [(s, a) for s, a in analyses.items()
@@ -931,6 +950,10 @@ def run():
                     if qty < lot["min_qty"]:
                         log.warning("  %s: qty %s below minimum, skipping.", symbol, qty)
                         continue
+                    # FIX: validar notional minimo ($6)
+                    if qty * pr < 6.0:
+                        log.warning("  %s: valor $%.2f bajo minimo notional, skipping.", symbol, qty * pr)
+                        continue
                     try:
                         place_order(client, symbol, "BUY", qty)
                         positions[symbol] = {
@@ -939,7 +962,7 @@ def run():
                             "open_time": now.isoformat(),
                             "peak_price": pr,
                         }
-                        save_positions(positions)  # FIX #8: persist after opening
+                        save_positions(positions)
                         log.info("  OPEN %s @ $%.4f | Qty:%s | SL:$%.4f | TP:$%.4f | Score:%d/6",
                                  symbol, pr, qty, sl, tp, a["score"])
                         log_trade(symbol, "BUY", pr, qty)
