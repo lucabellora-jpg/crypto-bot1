@@ -244,11 +244,19 @@ def reconcile_positions(client, positions):
             asset = symbol.replace("USDT", "")
             held  = balances.get(asset, 0)
             if held < pos["qty"] * 0.95:
+                            if held < pos["qty"] * 0.95:
                 log.warning(
                     "  Reconcile: %s no encontrado en Binance (esperado %.4f, encontrado %.4f) — eliminando.",
                     symbol, pos["qty"], held
                 )
                 to_remove.append(symbol)
+            elif held > pos["qty"] * 1.05:
+                # Tenemos MAS de lo esperado — actualizar qty al valor real
+                log.warning(
+                    "  Reconcile: %s tiene mas de lo esperado (%.4f vs %.4f) — actualizando qty.",
+                    symbol, held, pos["qty"]
+                )
+                positions[symbol]["qty"] = held
             else:
                 log.info("  Reconcile: %s OK (%.4f en cuenta).", symbol, held)
         for symbol in to_remove:
@@ -954,7 +962,13 @@ def run():
                     if qty * pr < 6.0:
                         log.warning("  %s: valor $%.2f bajo minimo notional, skipping.", symbol, qty * pr)
                         continue
+# DESPUÉS — verifica que no tengamos ya esa moneda en Binance
                     try:
+                        asset = symbol.replace("USDT", "")
+                        already_held = get_balance(client, asset)
+                        if already_held * pr > 5.0:
+                            log.warning("  %s: ya tenemos $%.2f en Binance, no compramos.", symbol, already_held * pr)
+                            continue
                         place_order(client, symbol, "BUY", qty)
                         positions[symbol] = {
                             "entry": pr, "qty": qty,
