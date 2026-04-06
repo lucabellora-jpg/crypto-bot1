@@ -922,9 +922,25 @@ def run():
                     except Exception as e:
                         log.error("  Error closing %s: %s", symbol, e)
                         if "-2010" in str(e):
-                            log.warning("  %s: balance insuficiente — eliminando posicion fantasma.", symbol)
-                            del positions[symbol]
-                            save_positions(positions)
+                            try:
+                                asset = symbol.replace("USDT", "")
+                                real_qty = get_balance(client, asset)
+                                if real_qty * price > 1.0:
+                                    log.warning("  %s: reintentando con qty real de Binance: %.6f", symbol, real_qty)
+                                    place_order(client, symbol, "SELL", round_step(real_qty, get_lot_rules(client, symbol)["step_size"]))
+                                    won = price > entry
+                                    log.info("  %s CLOSE(recovery) %s @ $%.4f | PnL: %+.2f%% | %s",
+                                             "OK" if won else "X", symbol, price, pnl, why)
+                                    log_trade(symbol, "SELL", price, real_qty, pnl, why)
+                                    learning.record_trade(symbol, pnl, params, won)
+                                    cooldowns[symbol] = now + timedelta(minutes=COIN_COOLDOWN_MIN)
+                                else:
+                                    log.warning("  %s: nada que vender en Binance, eliminando.", symbol)
+                            except Exception as e2:
+                                log.error("  %s: recovery fallida: %s", symbol, e2)
+                            finally:
+                                del positions[symbol]
+                                save_positions(positions)
 
             # Abrir nuevas posiciones
             if len(positions) < MAX_OPEN_TRADES and balance > 20 and not _circuit_breaker_active:
