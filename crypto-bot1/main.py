@@ -4,18 +4,19 @@
   Fixes aplicados:
     1. RSI sanity check (ignora RSI=0 o RSI=100)
     2. Tiempo maximo de posicion (4 horas)
-    3. Circuit breaker (25% — resetea correctamente en cada deploy)
+    3. Circuit breaker basado en PORTFOLIO TOTAL, no USDT libre
+       (fix definitivo — ya no se activa al comprar monedas)
     4. Cooldown por moneda (15 min tras cerrar)
     5. Trailing stop loss
     6. Learning dead zone cerrado (thresholds 0.50/0.55)
     7. last_adjusted se escribe en cada adaptacion
-    8. Posiciones persistidas en disco (sobreviven redeploys)
-    9. Reconciliacion de posiciones contra Binance al arrancar
-   10. Deteccion de candles congelados (RSI=50 fijo)
+    8. Posiciones persistidas en disco
+    9. Reconciliacion robusta: actualiza qty si hay mas, elimina si hay menos
+   10. Deteccion de candles congelados
    11. Validacion notional minimo ($6 por orden)
    12. Error -2010 auto-elimina posicion fantasma
-   13. Endpoint /api/reset para limpiar archivos desde browser
-   14. Circuit breaker NO acumula entre sesiones (usa balance real al arrancar)
+   13. Endpoint /api/reset accesible desde el dashboard
+   14. No compra si ya hay balance de esa moneda en Binance
 =============================================================
 """
 
@@ -52,7 +53,7 @@ MAX_OPEN_TRADES  = 2
 
 MAX_HOLD_HOURS      = 4
 COIN_COOLDOWN_MIN   = 15
-CIRCUIT_BREAKER_PCT = 0.25
+CIRCUIT_BREAKER_PCT = 0.15
 TRAIL_TRIGGER_PCT   = 0.02
 TRAIL_DISTANCE_PCT  = 0.02
 
@@ -263,6 +264,27 @@ def reconcile_positions(client, positions):
     return positions
 
 
+def get_portfolio_value(client, positions, analyses):
+    """
+    Calcula USDT libre + valor de mercado de todas las posiciones abiertas.
+    El circuit breaker usa este numero — comprar monedas NO lo activa.
+    """
+    usdt      = get_balance(client, "USDT")
+    portfolio = usdt
+    for symbol, pos in positions.items():
+        qty = float(pos["qty"])
+        if symbol in analyses:
+            price = analyses[symbol]["price"]
+        else:
+            try:
+                raw   = client.get_symbol_ticker(symbol=symbol)
+                price = float(raw["price"])
+            except Exception:
+                price = float(pos["entry"])
+        portfolio += price * qty
+    return portfolio
+
+
 # =============================================================
 #   INDICATORS
 # =============================================================
@@ -330,7 +352,6 @@ def analyze_symbol(candles, params):
     volumes = candles["volumes"]
     price   = closes[-1]
 
-    # FIX: Detectar candles congelados — si los ultimos 5 cierres son identicos, skip
     if len(set(closes[-5:])) == 1:
         return None
 
@@ -508,7 +529,7 @@ DASHBOARD_HTML = (
 '<div class="metrics">'
 '<div class="mcard"><div class="mlabel">Total trades</div><div class="mval" id="m1" style="color:var(--blu)">0</div><div class="msub" id="m1s">0W / 0L</div></div>'
 '<div class="mcard"><div class="mlabel">Win rate</div><div class="mval" id="m2">0%</div><div class="wr-bar"><div class="wr-fill" id="wrb" style="width:0%"></div></div></div>'
-'<div class="mcard"><div class="mlabel">PnL acumulado</div><div class="mval" id="m3">0.00%</div><div class="msub">trades cerrados esta sesion</div></div>'
+'<div class="mcard"><div class="mlabel">Portfolio</div><div class="mval" id="m3">$0.00</div><div class="msub" id="m3s">USDT + posiciones</div></div>'
 '<div class="mcard"><div class="mlabel">Ultimo ajuste</div><div class="mval" id="m4" style="color:var(--amb);font-size:16px">-</div><div class="msub" id="m4s">auto learning</div></div>'
 '</div>'
 '<div class="card"><div class="sec">Last log line</div><div class="logline" id="logline">Waiting...</div></div>'
@@ -525,7 +546,7 @@ DASHBOARD_HTML = (
 '<a class="dl-btn" href="/api/logs" download="bot.log">bot.log</a>'
 '<div style="margin-top:1.5rem">'
 '<div class="sec">Reset all bot data</div>'
-'<p style="font-size:12px;color:var(--mut);margin-bottom:.75rem">Clears positions, learning and trade history. Use only after manually selling all coins on Binance.</p>'
+'<p style="font-size:12px;color:var(--mut);margin-bottom:.75rem">Sell everything on Binance first, then reset.</p>'
 '<button class="copy-btn" style="background:var(--red)" onclick="doReset()">Reset all files</button>'
 '<div id="reset-msg" style="font-size:12px;margin-top:8px;color:var(--grn)"></div>'
 '</div>'
@@ -538,140 +559,99 @@ DASHBOARD_HTML = (
 '</div>'
 '<footer>Live dashboard auto-refresh 30s <span id="url-display"></span></footer>'
 '<script>'
-'var CN = {SOLUSDT:"Solana",DOGEUSDT:"Dogecoin",AVAXUSDT:"Avalanche",POLUSDT:"Polygon",LINKUSDT:"Chainlink",DOTUSDT:"Polkadot",ADAUSDT:"Cardano",LTCUSDT:"Litecoin"};'
-'var PL = {rsi_period:"RSI period",rsi_oversold:"RSI buy",rsi_overbought:"RSI sell",fast_ema:"Fast EMA",slow_ema:"Slow EMA",min_score:"Min score",volume_factor:"Vol factor",bb_period:"BB period"};'
-'var rawJson = "";'
-'document.getElementById("url-display").textContent = window.location.host;'
-'function showTab(id) {'
-'  var panels = document.querySelectorAll(".panel");'
-'  for (var i = 0; i < panels.length; i++) { panels[i].classList.remove("active"); }'
-'  var tabs = document.querySelectorAll(".tab");'
-'  for (var i = 0; i < tabs.length; i++) { tabs[i].classList.remove("active"); }'
-'  document.getElementById("t-" + id).classList.add("active");'
-'  document.getElementById("tab-" + id).classList.add("active");'
-'  if (id === "files") { loadJson(); }'
-'}'
-'function loadJson() {'
-'  fetch("/api/learning").then(function(r) { return r.text(); }).then(function(txt) {'
-'    rawJson = txt;'
-'    var preview = rawJson.length > 600 ? rawJson.slice(0, 600) + "...(download for full)" : rawJson;'
-'    document.getElementById("json-preview").textContent = preview;'
-'  }).catch(function() { document.getElementById("json-preview").textContent = "Not available yet."; });'
-'}'
-'function copyJson() {'
-'  navigator.clipboard.writeText(rawJson).then(function() {'
-'    var b = document.querySelector(".copy-btn");'
-'    b.textContent = "Copied!";'
-'    setTimeout(function() { b.textContent = "Copy to clipboard"; }, 2000);'
-'  });'
-'}'
-'function doReset() {'
-'  if (!confirm("This will delete all position and learning data. Make sure you have sold everything on Binance first!")) return;'
-'  fetch("/api/reset").then(function(r) { return r.json(); }).then(function(d) {'
-'    document.getElementById("reset-msg").textContent = d.ok ? "Reset successful. Restart the bot now." : "Reset failed.";'
-'  }).catch(function() { document.getElementById("reset-msg").textContent = "Error calling reset."; });'
-'}'
-'function fmtNum(n, dec) {'
-'  if (n === null || n === undefined || n === "") { return "-"; }'
-'  return parseFloat(n).toFixed(dec !== undefined ? dec : 2);'
-'}'
-'function renderTrades(trades) {'
-'  var el = document.getElementById("trade-list");'
-'  if (!trades || trades.length === 0) { el.innerHTML = "<div class=\\"empty\\">No trades yet.</div>"; return; }'
-'  var rows = "";'
-'  var limit = trades.length < 30 ? trades.length : 30;'
-'  for (var i = 0; i < limit; i++) {'
-'    var t = trades[i];'
-'    var isBuy = t.side.trim().toUpperCase() === "BUY";'
-'    var pval = t.pnl !== "" ? parseFloat(t.pnl) : null;'
-'    var pnlStr = "-";'
-'    if (pval !== null) {'
-'      var pc = pval >= 0 ? "var(--grn)" : "var(--red)";'
-'      var ps = pval >= 0 ? "+" : "";'
-'      pnlStr = "<span style=\\"color:" + pc + "\\">" + ps + fmtNum(pval) + "%</span>";'
-'    }'
-'    var sym = (t.symbol || "").trim().replace("USDT", "");'
-'    var bc = isBuy ? "buy" : "sell";'
-'    var pr = parseFloat(t.price || 0).toLocaleString("en-US", {minimumFractionDigits:2, maximumFractionDigits:4});'
-'    var tm = (t.time || "").slice(11, 16);'
-'    var rs = (t.reason || "").slice(0, 18);'
-'    rows += "<tr><td style=\\"color:var(--mut)\\">" + tm + "</td><td><span class=\\"badge " + bc + "\\">" + t.side.trim() + "</span></td><td>" + sym + "</td><td>$" + pr + "</td><td>" + pnlStr + "</td><td style=\\"color:var(--mut);font-size:10px\\">" + rs + "</td></tr>";'
-'  }'
-'  el.innerHTML = "<table><thead><tr><th>Time</th><th>Type</th><th>Coin</th><th>Price</th><th>PnL</th><th>Reason</th></tr></thead><tbody>" + rows + "</tbody></table>";'
-'}'
-'function renderCoins(stats) {'
-'  var el = document.getElementById("coin-list");'
-'  var keys = Object.keys(stats || {});'
-'  if (keys.length === 0) { el.innerHTML = "<div class=\\"empty\\">No coin data yet</div>"; return; }'
-'  keys.sort(function(a, b) {'
-'    var wa = stats[a].trades > 0 ? stats[a].wins / stats[a].trades : 0;'
-'    var wb = stats[b].trades > 0 ? stats[b].wins / stats[b].trades : 0;'
-'    return wb - wa;'
-'  });'
-'  var html = "";'
-'  for (var i = 0; i < keys.length; i++) {'
-'    var s = keys[i];'
-'    var st = stats[s];'
-'    var cwr = st.trades > 0 ? Math.round(st.wins / st.trades * 100) : 0;'
-'    var pnl2 = st.total_pnl || 0;'
-'    var c = cwr >= 55 ? "var(--grn)" : cwr >= 40 ? "var(--amb)" : "var(--red)";'
-'    var pc2 = pnl2 >= 0 ? "var(--grn)" : "var(--red)";'
-'    var ps2 = pnl2 >= 0 ? "+" : "";'
-'    var nm = (CN[s] || s).slice(0, 9);'
-'    html += "<div class=\\"crow\\"><div style=\\"font-weight:600\\">" + nm + "<span class=\\"ctag\\">" + s.replace("USDT","") + "</span></div>";'
-'    html += "<div style=\\"color:var(--mut)\\">" + st.trades + "t</div>";'
-'    html += "<div style=\\"color:" + c + "\\">" + cwr + "%</div>";'
-'    html += "<div style=\\"color:" + pc2 + "\\">" + ps2 + fmtNum(pnl2) + "%</div>";'
-'    html += "<div style=\\"background:rgba(255,255,255,.07);border-radius:3px;height:4px;width:60px\\"><div style=\\"width:" + cwr + "%;height:100%;border-radius:3px;background:" + c + "\\"></div></div></div>";'
-'  }'
-'  el.innerHTML = html;'
-'}'
-'function renderParams(params) {'
-'  var el = document.getElementById("params-grid");'
-'  var keys = Object.keys(PL).filter(function(k) { return params[k] !== undefined; });'
-'  if (keys.length === 0) { el.innerHTML = "<div class=\\"empty\\" style=\\"grid-column:1/-1\\">No data yet</div>"; return; }'
-'  var html = "";'
-'  for (var i = 0; i < keys.length; i++) {'
-'    var k = keys[i];'
-'    html += "<div class=\\"prow\\"><span class=\\"pk\\">" + PL[k] + "</span><span class=\\"pv\\">" + params[k] + "</span></div>";'
-'  }'
-'  el.innerHTML = html;'
-'}'
-'function load() {'
-'  fetch("/api/data").then(function(r) { return r.json(); }).then(function(d) {'
-'    var alive = d.status && d.status.running;'
-'    document.getElementById("sdot").className = "dot " + (alive ? "on" : "off");'
-'    document.getElementById("stxt").textContent = alive ? "Bot active" : "Bot stopped";'
-'    document.getElementById("m1").textContent = d.total || "0";'
-'    document.getElementById("m1s").textContent = (d.wins || 0) + "W / " + ((d.total || 0) - (d.wins || 0)) + "L";'
-'    var wr = d.win_rate || 0;'
-'    var we = document.getElementById("m2");'
-'    we.textContent = wr + "%";'
-'    we.style.color = wr >= 55 ? "var(--grn)" : wr >= 45 ? "var(--amb)" : "var(--red)";'
-'    document.getElementById("wrb").style.width = Math.min(wr, 100) + "%";'
-'    document.getElementById("wrb").style.background = wr >= 55 ? "var(--grn)" : wr >= 45 ? "var(--amb)" : "var(--red)";'
-'    var pnl = d.pnl_total || 0;'
-'    var pe = document.getElementById("m3");'
-'    pe.textContent = (pnl >= 0 ? "+" : "") + fmtNum(pnl) + "%";'
-'    pe.style.color = pnl >= 0 ? "var(--grn)" : "var(--red)";'
-'    var le = d.last_exp;'
-'    if (le) {'
-'      document.getElementById("m4").textContent = "Trade #" + le.at_trade;'
-'      var adjTxt = (le.adjustments && le.adjustments.length) ? le.adjustments.join(" / ") : "No changes";'
-'      document.getElementById("m4s").textContent = adjTxt;'
-'    }'
-'    document.getElementById("logline").textContent = (d.status && d.status.last_line) || "-";'
-'    var ab = document.getElementById("alerts-box");'
-'    ab.innerHTML = d.circuit_breaker ? "<div class=\\"alert-crit\\">Circuit breaker active - new trades paused.</div>" : "";'
-'    renderTrades(d.trades);'
-'    renderCoins(d.sym_stats);'
-'    renderParams(d.params);'
-'  }).catch(function(e) { console.error("load error", e); });'
-'}'
-'var s = 30;'
-'function tick() { s--; document.getElementById("cd").textContent = s; if (s <= 0) { s = 30; load(); } }'
-'load();'
-'setInterval(tick, 1000);'
+'var CN={SOLUSDT:"Solana",DOGEUSDT:"Dogecoin",LINKUSDT:"Chainlink",DOTUSDT:"Polkadot",LTCUSDT:"Litecoin"};'
+'var PL={rsi_period:"RSI period",rsi_oversold:"RSI buy",rsi_overbought:"RSI sell",fast_ema:"Fast EMA",slow_ema:"Slow EMA",min_score:"Min score",volume_factor:"Vol factor",bb_period:"BB period"};'
+'var rawJson="";'
+'document.getElementById("url-display").textContent=window.location.host;'
+'function showTab(id){'
+'var panels=document.querySelectorAll(".panel");'
+'for(var i=0;i<panels.length;i++){panels[i].classList.remove("active");}'
+'var tabs=document.querySelectorAll(".tab");'
+'for(var i=0;i<tabs.length;i++){tabs[i].classList.remove("active");}'
+'document.getElementById("t-"+id).classList.add("active");'
+'document.getElementById("tab-"+id).classList.add("active");'
+'if(id==="files"){loadJson();}}'
+'function loadJson(){'
+'fetch("/api/learning").then(function(r){return r.text();}).then(function(txt){'
+'rawJson=txt;'
+'var preview=rawJson.length>600?rawJson.slice(0,600)+"...(download for full)":rawJson;'
+'document.getElementById("json-preview").textContent=preview;'
+'}).catch(function(){document.getElementById("json-preview").textContent="Not available yet.";});}'
+'function copyJson(){'
+'navigator.clipboard.writeText(rawJson).then(function(){'
+'var b=document.querySelector(".copy-btn");b.textContent="Copied!";'
+'setTimeout(function(){b.textContent="Copy to clipboard";},2000);});}'
+'function doReset(){'
+'if(!confirm("Sell everything on Binance first! This will delete all bot data."))return;'
+'fetch("/api/reset").then(function(r){return r.json();}).then(function(d){'
+'document.getElementById("reset-msg").textContent=d.ok?"Reset done. Restart the bot now.":"Reset failed.";'
+'}).catch(function(){document.getElementById("reset-msg").textContent="Error.";});}'
+'function fmtNum(n,dec){'
+'if(n===null||n===undefined||n===""){return"-";}'
+'return parseFloat(n).toFixed(dec!==undefined?dec:2);}'
+'function renderTrades(trades){'
+'var el=document.getElementById("trade-list");'
+'if(!trades||trades.length===0){el.innerHTML="<div class=\\"empty\\">No trades yet.</div>";return;}'
+'var rows="";var limit=trades.length<30?trades.length:30;'
+'for(var i=0;i<limit;i++){'
+'var t=trades[i];var isBuy=t.side.trim().toUpperCase()==="BUY";'
+'var pval=t.pnl!==""?parseFloat(t.pnl):null;var pnlStr="-";'
+'if(pval!==null){var pc=pval>=0?"var(--grn)":"var(--red)";var ps=pval>=0?"+":"";'
+'pnlStr="<span style=\\"color:"+pc+"\\">"+ps+fmtNum(pval)+"%</span>";}'
+'var sym=(t.symbol||"").trim().replace("USDT","");var bc=isBuy?"buy":"sell";'
+'var pr=parseFloat(t.price||0).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:4});'
+'var tm=(t.time||"").slice(11,16);var rs=(t.reason||"").slice(0,18);'
+'rows+="<tr><td style=\\"color:var(--mut)\\">"+tm+"</td><td><span class=\\"badge "+bc+"\\">"+t.side.trim()+"</span></td><td>"+sym+"</td><td>$"+pr+"</td><td>"+pnlStr+"</td><td style=\\"color:var(--mut);font-size:10px\\">"+rs+"</td></tr>";}'
+'el.innerHTML="<table><thead><tr><th>Time</th><th>Type</th><th>Coin</th><th>Price</th><th>PnL</th><th>Reason</th></tr></thead><tbody>"+rows+"</tbody></table>";}'
+'function renderCoins(stats){'
+'var el=document.getElementById("coin-list");var keys=Object.keys(stats||{});'
+'if(keys.length===0){el.innerHTML="<div class=\\"empty\\">No coin data yet</div>";return;}'
+'keys.sort(function(a,b){var wa=stats[a].trades>0?stats[a].wins/stats[a].trades:0;var wb=stats[b].trades>0?stats[b].wins/stats[b].trades:0;return wb-wa;});'
+'var html="";for(var i=0;i<keys.length;i++){'
+'var s=keys[i];var st=stats[s];var cwr=st.trades>0?Math.round(st.wins/st.trades*100):0;'
+'var pnl2=st.total_pnl||0;var c=cwr>=55?"var(--grn)":cwr>=40?"var(--amb)":"var(--red)";'
+'var pc2=pnl2>=0?"var(--grn)":"var(--red)";var ps2=pnl2>=0?"+":"";var nm=(CN[s]||s).slice(0,9);'
+'html+="<div class=\\"crow\\"><div style=\\"font-weight:600\\">"+nm+"<span class=\\"ctag\\">"+s.replace("USDT","")+"</span></div>";'
+'html+="<div style=\\"color:var(--mut)\\">"+st.trades+"t</div>";'
+'html+="<div style=\\"color:"+c+"\\">"+cwr+"%</div>";'
+'html+="<div style=\\"color:"+pc2+"\\">"+ps2+fmtNum(pnl2)+"%</div>";'
+'html+="<div style=\\"background:rgba(255,255,255,.07);border-radius:3px;height:4px;width:60px\\"><div style=\\"width:"+cwr+"%;height:100%;border-radius:3px;background:"+c+"\\"></div></div></div>";}'
+'el.innerHTML=html;}'
+'function renderParams(params){'
+'var el=document.getElementById("params-grid");'
+'var keys=Object.keys(PL).filter(function(k){return params[k]!==undefined;});'
+'if(keys.length===0){el.innerHTML="<div class=\\"empty\\" style=\\"grid-column:1/-1\\">No data yet</div>";return;}'
+'var html="";for(var i=0;i<keys.length;i++){var k=keys[i];'
+'html+="<div class=\\"prow\\"><span class=\\"pk\\">"+PL[k]+"</span><span class=\\"pv\\">"+params[k]+"</span></div>";}'
+'el.innerHTML=html;}'
+'function load(){'
+'fetch("/api/data").then(function(r){return r.json();}).then(function(d){'
+'var alive=d.status&&d.status.running;'
+'document.getElementById("sdot").className="dot "+(alive?"on":"off");'
+'document.getElementById("stxt").textContent=alive?"Bot active":"Bot stopped";'
+'document.getElementById("m1").textContent=d.total||"0";'
+'document.getElementById("m1s").textContent=(d.wins||0)+"W / "+((d.total||0)-(d.wins||0))+"L";'
+'var wr=d.win_rate||0;var we=document.getElementById("m2");'
+'we.textContent=wr+"%";'
+'we.style.color=wr>=55?"var(--grn)":wr>=45?"var(--amb)":"var(--red)";'
+'document.getElementById("wrb").style.width=Math.min(wr,100)+"%";'
+'document.getElementById("wrb").style.background=wr>=55?"var(--grn)":wr>=45?"var(--amb)":"var(--red)";'
+'var pv=d.portfolio_value||0;var pe=document.getElementById("m3");'
+'pe.textContent="$"+pv.toFixed(2);'
+'pe.style.color=pv>=(d.start_balance||0)?"var(--grn)":"var(--red)";'
+'document.getElementById("m3s").textContent="inicio: $"+(d.start_balance||0).toFixed(2);'
+'var le=d.last_exp;'
+'if(le){document.getElementById("m4").textContent="Trade #"+le.at_trade;'
+'var adjTxt=(le.adjustments&&le.adjustments.length)?le.adjustments.join(" / "):"No changes";'
+'document.getElementById("m4s").textContent=adjTxt;}'
+'document.getElementById("logline").textContent=(d.status&&d.status.last_line)||"-";'
+'var ab=document.getElementById("alerts-box");'
+'ab.innerHTML=d.circuit_breaker?"<div class=\\"alert-crit\\">Circuit breaker active - portfolio dropped 15%. New trades paused.</div>":"";'
+'renderTrades(d.trades);renderCoins(d.sym_stats);renderParams(d.params);'
+'}).catch(function(e){console.error("load error",e);});}'
+'var s=30;'
+'function tick(){s--;document.getElementById("cd").textContent=s;if(s<=0){s=30;load();}}'
+'load();setInterval(tick,1000);'
 '</script>'
 '</body>'
 '</html>'
@@ -738,6 +718,8 @@ def read_status():
         return {"running": False, "last_line": "Error.", "last_time": "-"}
 
 _circuit_breaker_active = False
+_start_balance          = 0.0
+_portfolio_value        = 0.0
 
 def build_api_data():
     learning = read_learning()
@@ -746,15 +728,18 @@ def build_api_data():
     total    = learning.get("total_trades", 0)
     wins     = learning.get("total_wins", 0)
     wr       = round(wins / total * 100, 1) if total > 0 else 0
-    pnl      = sum(float(t["pnl"]) for t in trades if t["pnl"])
     exps     = learning.get("param_experiments", [])
     return {
-        "status": status, "total": total, "wins": wins, "win_rate": wr,
-        "pnl_total": round(pnl, 2),
-        "sym_stats": learning.get("symbol_stats", {}),
-        "params":    learning.get("params", {}),
-        "last_exp":  exps[-1] if exps else None,
-        "trades":    trades[:50],
+        "status":          status,
+        "total":           total,
+        "wins":            wins,
+        "win_rate":        wr,
+        "portfolio_value": round(_portfolio_value, 2),
+        "start_balance":   round(_start_balance, 2),
+        "sym_stats":       learning.get("symbol_stats", {}),
+        "params":          learning.get("params", {}),
+        "last_exp":        exps[-1] if exps else None,
+        "trades":          trades[:50],
         "circuit_breaker": _circuit_breaker_active,
     }
 
@@ -801,7 +786,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send(404, "text/plain", "Not found.")
         elif p == "/api/reset":
-            # FIX: endpoint de reset accesible desde el browser
             for f in [LEARNING_FILE, POSITIONS_FILE, TRADE_LOG_FILE]:
                 if os.path.exists(f):
                     os.remove(f)
@@ -823,29 +807,35 @@ def start_dashboard():
 # =============================================================
 
 def run():
-    global _circuit_breaker_active
+    global _circuit_breaker_active, _start_balance, _portfolio_value
 
     log.info("=" * 55)
     log.info("  ADAPTIVE BOT v2 - VOLATILE ALTCOINS")
     log.info("  Coins     : %s", ", ".join(SYMBOLS))
     log.info("  Interval  : %s | Mode: %s", INTERVAL, "TESTNET" if USE_TESTNET else "*** LIVE ***")
-    log.info("  Max hold  : %dh | Cooldown: %dmin | CB: -%d%%", MAX_HOLD_HOURS, COIN_COOLDOWN_MIN, int(CIRCUIT_BREAKER_PCT * 100))
+    log.info("  Max hold  : %dh | Cooldown: %dmin | CB: -%d%%",
+             MAX_HOLD_HOURS, COIN_COOLDOWN_MIN, int(CIRCUIT_BREAKER_PCT * 100))
     log.info("=" * 55)
 
     client   = create_client()
     learning = LearningSystem()
     learning.print_summary()
 
-    # Cargar y reconciliar posiciones
     positions = load_positions()
     positions = reconcile_positions(client, positions)
     cooldowns = {}
 
-    # FIX: start_balance siempre se captura del balance REAL en Binance al arrancar
-    # Esto evita que el circuit breaker herede caidas de sesiones anteriores
-    start_balance = get_balance(client, "USDT")
-    log.info("Starting balance: $%.2f (circuit breaker se activa si cae a $%.2f)",
-             start_balance, start_balance * (1 - CIRCUIT_BREAKER_PCT))
+    # start_balance = portfolio completo al arrancar
+    _start_balance = get_balance(client, "USDT")
+    for symbol, pos in positions.items():
+        try:
+            raw = client.get_symbol_ticker(symbol=symbol)
+            _start_balance += float(raw["price"]) * float(pos["qty"])
+        except Exception:
+            _start_balance += float(pos["entry"]) * float(pos["qty"])
+
+    log.info("Starting portfolio: $%.2f (CB se activa si cae a $%.2f)",
+             _start_balance, _start_balance * (1 - CIRCUIT_BREAKER_PCT))
     cycle = 0
 
     while True:
@@ -854,20 +844,8 @@ def run():
             now     = datetime.now()
             params  = learning.get_params()
             balance = get_balance(client, "USDT")
-            log.info("\n-- Cycle #%d | %s | Balance: $%.2f | Positions: %d/%d --",
-                     cycle, now.strftime("%H:%M:%S"), balance, len(positions), MAX_OPEN_TRADES)
 
-            # Circuit breaker basado en balance USDT libre vs arranque
-            if start_balance > 0:
-                drop = (start_balance - balance) / start_balance
-                if drop >= CIRCUIT_BREAKER_PCT:
-                    _circuit_breaker_active = True
-                    log.warning("  CIRCUIT BREAKER active - dropped %.1f%% from $%.0f. New trades paused.",
-                                drop * 100, start_balance)
-                else:
-                    _circuit_breaker_active = False
-
-            # Analizar simbolos
+            # Analizar mercado
             analyses = {}
             for symbol in learning.get_best_symbols():
                 try:
@@ -878,10 +856,26 @@ def run():
                         continue
                     result["hour_q"] = learning.get_hour_quality(now.hour)
                     analyses[symbol] = result
-                    log.info("  %-12s $%10.4f | RSI=%5.1f | Score=%d/6 | Vol x%.1f",
-                             symbol, result["price"], result["rsi"], result["score"], result["vol_ratio"])
                 except Exception as e:
                     log.warning("  Error on %s: %s", symbol, e)
+
+            # Circuit breaker sobre portfolio total (USDT + monedas)
+            _portfolio_value = get_portfolio_value(client, positions, analyses)
+            drop = (_start_balance - _portfolio_value) / _start_balance if _start_balance > 0 else 0
+            _circuit_breaker_active = drop >= CIRCUIT_BREAKER_PCT
+
+            log.info("\n-- Cycle #%d | %s | USDT: $%.2f | Portfolio: $%.2f | Positions: %d/%d%s --",
+                     cycle, now.strftime("%H:%M:%S"), balance, _portfolio_value,
+                     len(positions), MAX_OPEN_TRADES,
+                     " | CB ACTIVO" if _circuit_breaker_active else "")
+
+            if _circuit_breaker_active:
+                log.warning("  CIRCUIT BREAKER: portfolio bajo %.1f%% desde $%.2f. No nuevas compras.",
+                            drop * 100, _start_balance)
+
+            for symbol, result in analyses.items():
+                log.info("  %-12s $%10.4f | RSI=%5.1f | Score=%d/6 | Vol x%.1f",
+                         symbol, result["price"], result["rsi"], result["score"], result["vol_ratio"])
 
             # Gestionar posiciones abiertas
             for symbol, pos in list(positions.items()):
@@ -889,24 +883,25 @@ def run():
                     continue
                 a     = analyses[symbol]
                 price = a["price"]
-                entry = pos["entry"]
+                entry = float(pos["entry"])
+                qty   = float(pos["qty"])
                 pnl   = (price - entry) / entry * 100
 
-                if price > pos.get("peak_price", entry):
+                if price > float(pos.get("peak_price", entry)):
                     pos["peak_price"] = price
-                peak = pos.get("peak_price", entry)
+                peak = float(pos.get("peak_price", entry))
                 if (peak - entry) / entry >= TRAIL_TRIGGER_PCT:
                     trail_sl = peak * (1 - TRAIL_DISTANCE_PCT)
-                    if trail_sl > pos["stop_loss"]:
+                    if trail_sl > float(pos["stop_loss"]):
                         pos["stop_loss"] = trail_sl
                         log.info("  Trailing SL %s -> $%.4f", symbol, trail_sl)
                         save_positions(positions)
 
                 held_h = (now - datetime.fromisoformat(pos["open_time"])).total_seconds() / 3600
                 why = None
-                if price <= pos["stop_loss"]:
+                if price <= float(pos["stop_loss"]):
                     why = "STOP LOSS"
-                elif price >= pos["take_profit"]:
+                elif price >= float(pos["take_profit"]):
                     why = "TAKE PROFIT"
                 elif a["sell_signal"]:
                     why = "SELL SIGNAL"
@@ -915,20 +910,19 @@ def run():
 
                 if why:
                     try:
-                        place_order(client, symbol, "SELL", pos["qty"])
+                        place_order(client, symbol, "SELL", qty)
                         won = price > entry
                         log.info("  %s CLOSE %s @ $%.4f | PnL: %+.2f%% | %s",
                                  "OK" if won else "X", symbol, price, pnl, why)
-                        log_trade(symbol, "SELL", price, pos["qty"], pnl, why)
+                        log_trade(symbol, "SELL", price, qty, pnl, why)
                         learning.record_trade(symbol, pnl, params, won)
                         cooldowns[symbol] = now + timedelta(minutes=COIN_COOLDOWN_MIN)
                         del positions[symbol]
                         save_positions(positions)
                     except Exception as e:
                         log.error("  Error closing %s: %s", symbol, e)
-                        # FIX: si Binance dice que no hay balance, la posicion es fantasma
                         if "-2010" in str(e):
-                            log.warning("  %s: balance insuficiente en Binance — eliminando posicion fantasma.", symbol)
+                            log.warning("  %s: balance insuficiente — eliminando posicion fantasma.", symbol)
                             del positions[symbol]
                             save_positions(positions)
 
@@ -944,32 +938,33 @@ def run():
                 for symbol, a in candidates:
                     if len(positions) >= MAX_OPEN_TRADES:
                         break
-                    pr        = a["price"]
-                    sl        = round(pr * (1 - a["sl_pct"]), 6)
-                    tp        = round(pr * (1 + a["tp_pct"]), 6)
-                    lot       = get_lot_rules(client, symbol)
+                    pr  = a["price"]
+                    sl  = round(pr * (1 - a["sl_pct"]), 6)
+                    tp  = round(pr * (1 + a["tp_pct"]), 6)
+                    lot = get_lot_rules(client, symbol)
                     trade_val = balance * MAX_TRADE_PCT / (MAX_OPEN_TRADES - len(positions))
-                    qty       = round_step(trade_val / pr, lot["step_size"])
+                    qty = round_step(trade_val / pr, lot["step_size"])
                     if qty < lot["min_qty"]:
                         log.warning("  %s: qty %s below minimum, skipping.", symbol, qty)
                         continue
-                    # FIX: validar notional minimo ($6)
                     if qty * pr < 6.0:
                         log.warning("  %s: valor $%.2f bajo minimo notional, skipping.", symbol, qty * pr)
                         continue
-# DESPUÉS — verifica que no tengamos ya esa moneda en Binance
+                    # No comprar si ya hay esa moneda en Binance
+                    asset = symbol.replace("USDT", "")
+                    already_held = get_balance(client, asset)
+                    if already_held * pr > 5.0:
+                        log.warning("  %s: ya tenemos $%.2f en Binance, skipping doble compra.", symbol, already_held * pr)
+                        continue
                     try:
-                        asset = symbol.replace("USDT", "")
-                        already_held = get_balance(client, asset)
-                        if already_held * pr > 5.0:
-                            log.warning("  %s: ya tenemos $%.2f en Binance, no compramos.", symbol, already_held * pr)
-                            continue
                         place_order(client, symbol, "BUY", qty)
                         positions[symbol] = {
-                            "entry": pr, "qty": qty,
-                            "stop_loss": sl, "take_profit": tp,
-                            "open_time": now.isoformat(),
-                            "peak_price": pr,
+                            "entry":       pr,
+                            "qty":         qty,
+                            "stop_loss":   sl,
+                            "take_profit": tp,
+                            "open_time":   now.isoformat(),
+                            "peak_price":  pr,
                         }
                         save_positions(positions)
                         log.info("  OPEN %s @ $%.4f | Qty:%s | SL:$%.4f | TP:$%.4f | Score:%d/6",
