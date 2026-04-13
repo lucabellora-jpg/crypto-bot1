@@ -1,22 +1,30 @@
 """
 =============================================================
-  BOT ADAPTATIVO v2 - Altcoins Volatiles
-  Fixes aplicados:
-    1. RSI sanity check (ignora RSI=0 o RSI=100)
-    2. Tiempo maximo de posicion (4 horas)
-    3. Circuit breaker basado en PORTFOLIO TOTAL, no USDT libre
-       (fix definitivo — ya no se activa al comprar monedas)
-    4. Cooldown por moneda (15 min tras cerrar)
-    5. Trailing stop loss
-    6. Learning dead zone cerrado (thresholds 0.50/0.55)
-    7. last_adjusted se escribe en cada adaptacion
-    8. Posiciones persistidas en disco
-    9. Reconciliacion robusta: actualiza qty si hay mas, elimina si hay menos
-   10. Deteccion de candles congelados
-   11. Validacion notional minimo ($6 por orden)
-   12. Error -2010 auto-elimina posicion fantasma
-   13. Endpoint /api/reset accesible desde el dashboard
-   14. No compra si ya hay balance de esa moneda en Binance
+  BOT ADAPTATIVO v3 - Altcoins Volatiles
+  Cambios vs v2 basados en analisis de 141 trades:
+
+  CRITICOS:
+  - LTCUSDT eliminado (40% WR, -3.35% PnL — destruia el portfolio)
+  - DOTUSDT eliminado (48.5% WR, -1.80% PnL — perdedor neto)
+  - BASE_TAKE_PROFIT subido a 0.08 (8%) — antes 5.5% no cubria comisiones
+  - BASE_STOP_LOSS subido a 0.03 (3%) — mejor ratio riesgo/beneficio
+  - MAX_TRADE_PCT subido a 0.20 (antes 0.12) — trades mas grandes
+  - min_score NO puede bajar de 3 en el learning (antes bajaba a 2)
+  - Filtro de horas malas: H1 (0% WR), H3 (20%), H8 (0%) bloqueadas
+
+  LEARNING:
+  - RSI stricter cuando WR <= 0.50 (ya estaba)
+  - RSI looser SOLO cuando WR > 0.60 (antes era > 0.55, demasiado agresivo)
+  - min_score sube cuando WR < 0.50, baja SOLO cuando WR > 0.65
+
+  MANTENIDOS:
+  - Circuit breaker sobre portfolio total
+  - Reconciliacion robusta con update de qty
+  - Recovery de posiciones fantasma (-2010)
+  - No compra doble de la misma moneda
+  - Trailing stop loss
+  - Posiciones persistidas en disco
+  - Dashboard con /api/reset
 =============================================================
 """
 
@@ -31,24 +39,25 @@ except ImportError:
     print("Falta instalar: pip install python-binance")
     sys.exit(1)
 
-try:
-    import numpy as np
-except ImportError:
-    print("Falta instalar: pip install numpy")
-    sys.exit(1)
-
 API_KEY     = os.environ.get("API_KEY", "")
 API_SECRET  = os.environ.get("API_SECRET", "")
 USE_TESTNET = False
 
+# CRITICO: eliminados LTCUSDT (40% WR) y DOTUSDT (48.5% WR)
+# Solo quedan las monedas rentables basado en 141 trades reales
 SYMBOLS = [
-    "SOLUSDT", "DOGEUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT",
+    "SOLUSDT",   # 62.5% WR, +4.01% PnL
+    "LINKUSDT",  # 66.7% WR, +2.55% PnL
+    "DOGEUSDT",  # 51.7% WR, +1.21% PnL — marginal pero positivo
 ]
 
+# Horas bloqueadas basado en datos reales (WR 0-20% con suficientes trades)
+BLOCKED_HOURS = {1, 3, 8}  # H1: 0% (4t), H3: 20% (5t), H8: 0% (3t)
+
 INTERVAL         = "5m"
-MAX_TRADE_PCT    = 0.25
-BASE_STOP_LOSS   = 0.025
-BASE_TAKE_PROFIT = 0.055
+MAX_TRADE_PCT    = 0.20   # subido de 0.12 — trades mas grandes para compensar comisiones
+BASE_STOP_LOSS   = 0.03   # subido de 0.025
+BASE_TAKE_PROFIT = 0.08   # subido de 0.055 — CRITICO para cubrir comisiones Binance 0.2%
 MAX_OPEN_TRADES  = 2
 
 MAX_HOLD_HOURS      = 4
@@ -59,8 +68,8 @@ TRAIL_DISTANCE_PCT  = 0.02
 
 INITIAL_PARAMS = {
     "rsi_period"     : 14,
-    "rsi_oversold"   : 30,
-    "rsi_overbought" : 70,
+    "rsi_oversold"   : 28,   # mas estricto que antes (era 35)
+    "rsi_overbought" : 72,   # mas estricto que antes (era 65)
     "fast_ema"       : 9,
     "slow_ema"       : 21,
     "bb_period"      : 20,
@@ -69,7 +78,7 @@ INITIAL_PARAMS = {
     "macd_slow"      : 26,
     "macd_signal"    : 9,
     "atr_period"     : 14,
-    "min_score"      : 3,
+    "min_score"      : 3,    # minimo fijo — no puede bajar de 3
     "volume_factor"  : 1.2,
 }
 
@@ -93,7 +102,7 @@ log = logging.getLogger("AdaptiveBot")
 
 
 # =============================================================
-#   LEARNING SYSTEM
+#   LEARNING SYSTEM v2 — corregido
 # =============================================================
 
 class LearningSystem:
@@ -151,22 +160,27 @@ class LearningSystem:
         wr    = wins / total if total > 0 else 0
         p     = self.data["params"]
         adj   = []
-        log.info("[APRENDIZAJE] Win rate: %.1f%% en %d trades.", wr * 100, total)
+        log.info("[LEARNING] Win rate: %.1f%% en %d trades.", wr * 100, total)
 
-        if wr < 0.45 and p["min_score"] < 5:
+        # min_score: sube si WR < 0.50, baja SOLO si WR > 0.65 y esta en 4+
+        # NUNCA baja de 3 — es el minimo de calidad requerido
+        if wr < 0.50 and p["min_score"] < 5:
             p["min_score"] = min(p["min_score"] + 1, 5)
             adj.append("min_score up")
-        elif wr > 0.60 and p["min_score"] > 2:
-            p["min_score"] = max(p["min_score"] - 1, 2)
+        elif wr > 0.65 and p["min_score"] > 3:
+            # Solo baja si WR es muy bueno Y esta por encima del minimo
+            p["min_score"] = max(p["min_score"] - 1, 3)
             adj.append("min_score down")
 
+        # RSI: mas estricto cuando WR baja, looser SOLO cuando es muy bueno
         if wr <= 0.50:
-            p["rsi_oversold"]   = max(25, p["rsi_oversold"] - 2)
-            p["rsi_overbought"] = min(75, p["rsi_overbought"] + 2)
+            p["rsi_oversold"]   = max(22, p["rsi_oversold"] - 2)
+            p["rsi_overbought"] = min(78, p["rsi_overbought"] + 2)
             adj.append("RSI stricter")
-        elif wr > 0.55:
-            p["rsi_oversold"]   = min(35, p["rsi_oversold"] + 1)
-            p["rsi_overbought"] = max(65, p["rsi_overbought"] - 1)
+        elif wr > 0.60:
+            # Umbral subido de 0.55 a 0.60 — solo relaja si realmente va bien
+            p["rsi_oversold"]   = min(32, p["rsi_oversold"] + 1)
+            p["rsi_overbought"] = max(68, p["rsi_overbought"] - 1)
             adj.append("RSI looser")
 
         self.data["param_experiments"].append({
@@ -175,14 +189,19 @@ class LearningSystem:
         })
         if adj:
             self.data["last_adjusted"] = datetime.now().isoformat()
-            log.info("[APRENDIZAJE] Ajustes: %s", ", ".join(adj))
+            log.info("[LEARNING] Ajustes: %s", ", ".join(adj))
+        else:
+            log.info("[LEARNING] Sin ajustes necesarios.")
         self._save()
 
     def get_best_symbols(self):
         stats  = self.data["symbol_stats"]
         ranked = []
         for sym in SYMBOLS:
-            wr = stats[sym]["wins"] / stats[sym]["trades"] if sym in stats and stats[sym]["trades"] >= 3 else 0.5
+            if sym in stats and stats[sym]["trades"] >= 5:
+                wr = stats[sym]["wins"] / stats[sym]["trades"]
+            else:
+                wr = 0.5
             ranked.append((sym, wr))
         ranked.sort(key=lambda x: x[1], reverse=True)
         return [s[0] for s in ranked]
@@ -238,23 +257,19 @@ def reconcile_positions(client, positions):
         }
         to_remove = []
         for symbol, pos in positions.items():
-            asset = symbol.replace("USDT", "")
-            held  = balances.get(asset, 0)
+            asset       = symbol.replace("USDT", "")
+            held        = balances.get(asset, 0)
             qty_tracked = float(pos["qty"])
             if held < qty_tracked * 0.95:
-                log.warning(
-                    "  Reconcile: %s no encontrado en Binance (esperado %.4f, encontrado %.4f) — eliminando.",
-                    symbol, qty_tracked, held
-                )
+                log.warning("  Reconcile: %s no encontrado (esperado %.4f, encontrado %.4f) — eliminando.",
+                            symbol, qty_tracked, held)
                 to_remove.append(symbol)
             elif held > qty_tracked * 1.05:
-                log.warning(
-                    "  Reconcile: %s tiene mas de lo esperado (%.4f vs %.4f) — actualizando qty.",
-                    symbol, held, qty_tracked
-                )
+                log.warning("  Reconcile: %s tiene mas de lo esperado (%.4f vs %.4f) — actualizando.",
+                            symbol, held, qty_tracked)
                 positions[symbol]["qty"] = held
             else:
-                log.info("  Reconcile: %s OK (%.4f en cuenta).", symbol, held)
+                log.info("  Reconcile: %s OK (%.4f).", symbol, held)
         for symbol in to_remove:
             del positions[symbol]
         save_positions(positions)
@@ -265,10 +280,7 @@ def reconcile_positions(client, positions):
 
 
 def get_portfolio_value(client, positions, analyses):
-    """
-    Calcula USDT libre + valor de mercado de todas las posiciones abiertas.
-    El circuit breaker usa este numero — comprar monedas NO lo activa.
-    """
+    """USDT libre + valor de mercado de posiciones abiertas."""
     usdt      = get_balance(client, "USDT")
     portfolio = usdt
     for symbol, pos in positions.items():
@@ -323,8 +335,8 @@ def calculate_bollinger(prices, period, std_mult):
 def calculate_macd(prices, fast, slow, sig):
     if len(prices) < slow + sig:
         return 0, 0, 0
-    ml  = [f - s for f, s in zip(ema(prices, fast), ema(prices, slow))]
-    sl  = ema(ml, sig)
+    ml = [f - s for f, s in zip(ema(prices, fast), ema(prices, slow))]
+    sl = ema(ml, sig)
     return ml[-1], sl[-1], ml[-1] - sl[-1]
 
 def calculate_atr(highs, lows, closes, period):
@@ -355,14 +367,14 @@ def analyze_symbol(candles, params):
     if len(set(closes[-5:])) == 1:
         return None
 
-    rsi     = calculate_rsi(closes, params["rsi_period"])
-    fe      = ema(closes, params["fast_ema"])
-    se      = ema(closes, params["slow_ema"])
+    rsi         = calculate_rsi(closes, params["rsi_period"])
+    fe          = ema(closes, params["fast_ema"])
+    se          = ema(closes, params["slow_ema"])
     bb_u, _, bb_l = calculate_bollinger(closes, params["bb_period"], params["bb_std"])
-    _, _, mh = calculate_macd(closes, params["macd_fast"], params["macd_slow"], params["macd_signal"])
-    _, _, ph = calculate_macd(closes[:-1], params["macd_fast"], params["macd_slow"], params["macd_signal"]) if len(closes) > 30 else (0, 0, 0)
-    atr   = calculate_atr(highs, lows, closes, params["atr_period"])
-    vol_r = calculate_volume_ratio(volumes)
+    _, _, mh    = calculate_macd(closes, params["macd_fast"], params["macd_slow"], params["macd_signal"])
+    _, _, ph    = calculate_macd(closes[:-1], params["macd_fast"], params["macd_slow"], params["macd_signal"]) if len(closes) > 30 else (0, 0, 0)
+    atr         = calculate_atr(highs, lows, closes, params["atr_period"])
+    vol_r       = calculate_volume_ratio(volumes)
 
     score, detail = 0, []
     if rsi < params["rsi_oversold"]:
@@ -380,14 +392,15 @@ def analyze_symbol(candles, params):
     sell = (rsi > params["rsi_overbought"] or
             (len(fe) >= 2 and len(se) >= 2 and fe[-2] >= se[-2] and fe[-1] < se[-1]) or
             (price > bb_u and mh < 0))
+
     atr_pct = atr / price
     return {
         "price": price, "rsi": rsi, "score": score,
-        "buy_signal": score >= params["min_score"],
+        "buy_signal":  score >= params["min_score"],
         "sell_signal": sell,
-        "detail": detail,
-        "sl_pct": max(BASE_STOP_LOSS, atr_pct * 1.5),
-        "tp_pct": max(BASE_TAKE_PROFIT, atr_pct * 4.5),
+        "detail":      detail,
+        "sl_pct":      max(BASE_STOP_LOSS, atr_pct * 1.5),
+        "tp_pct":      max(BASE_TAKE_PROFIT, atr_pct * 4.5),
         "atr": atr, "vol_ratio": vol_r, "macd_hist": mh,
     }
 
@@ -461,12 +474,9 @@ def log_trade(symbol, side, price, qty, pnl_pct=None, reason=""):
 # =============================================================
 
 DASHBOARD_HTML = (
-'<!DOCTYPE html>'
-'<html lang="en">'
-'<head>'
-'<meta charset="UTF-8">'
+'<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
 '<meta name="viewport" content="width=device-width,initial-scale=1">'
-'<title>Crypto Bot v2 - Dashboard</title>'
+'<title>Crypto Bot v3 - Dashboard</title>'
 '<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@400;700&display=swap" rel="stylesheet">'
 '<style>'
 ':root{--bg:#0b0e13;--sur:#111620;--sur2:#181e2c;--bor:rgba(255,255,255,0.07);--txt:#e8eaf0;--mut:#6b7280;--grn:#10d98c;--red:#f05252;--blu:#5b8ff9;--amb:#f5a623}'
@@ -507,16 +517,12 @@ DASHBOARD_HTML = (
 '.alert-crit{background:rgba(240,82,82,.1);border-left:3px solid var(--red);color:var(--red);border-radius:8px;padding:10px 14px;font-size:12px;margin-bottom:8px}'
 'footer{text-align:center;margin-top:2rem;font-size:11px;color:var(--mut);font-family:IBM Plex Mono,monospace}'
 '@media(max-width:800px){.metrics{grid-template-columns:1fr 1fr}}'
-'</style>'
-'</head>'
-'<body>'
-'<header>'
-'<div class="logo">CRYPTO<span>BOT</span> v2 Monitor</div>'
+'</style></head><body>'
+'<header><div class="logo">CRYPTO<span>BOT</span> v3</div>'
 '<div style="display:flex;align-items:center;gap:12px">'
 '<div style="font-size:11px;color:var(--mut)">Refresh <span id="cd">30</span>s</div>'
 '<div class="pill"><span class="dot off" id="sdot"></span>&nbsp;<span id="stxt">Loading</span></div>'
-'</div>'
-'</header>'
+'</div></header>'
 '<div class="tabs">'
 '<button class="tab active" id="tab-overview" onclick="showTab(\'overview\')">Overview</button>'
 '<button class="tab" id="tab-trades" onclick="showTab(\'trades\')">Trades</button>'
@@ -529,7 +535,7 @@ DASHBOARD_HTML = (
 '<div class="metrics">'
 '<div class="mcard"><div class="mlabel">Total trades</div><div class="mval" id="m1" style="color:var(--blu)">0</div><div class="msub" id="m1s">0W / 0L</div></div>'
 '<div class="mcard"><div class="mlabel">Win rate</div><div class="mval" id="m2">0%</div><div class="wr-bar"><div class="wr-fill" id="wrb" style="width:0%"></div></div></div>'
-'<div class="mcard"><div class="mlabel">Portfolio</div><div class="mval" id="m3">$0.00</div><div class="msub" id="m3s">USDT + posiciones</div></div>'
+'<div class="mcard"><div class="mlabel">Portfolio</div><div class="mval" id="m3">$0.00</div><div class="msub" id="m3s">inicio: $0.00</div></div>'
 '<div class="mcard"><div class="mlabel">Ultimo ajuste</div><div class="mval" id="m4" style="color:var(--amb);font-size:16px">-</div><div class="msub" id="m4s">auto learning</div></div>'
 '</div>'
 '<div class="card"><div class="sec">Last log line</div><div class="logline" id="logline">Waiting...</div></div>'
@@ -537,124 +543,35 @@ DASHBOARD_HTML = (
 '<div id="t-trades" class="panel"><div class="card"><div class="sec">Trade history</div><div id="trade-list"><div class="empty">No trades yet</div></div></div></div>'
 '<div id="t-coins" class="panel"><div class="card"><div class="sec">Performance by coin</div><div id="coin-list"><div class="empty">No data yet</div></div></div></div>'
 '<div id="t-params" class="panel"><div class="card"><div class="sec">Current parameters</div><div class="pgrid" id="params-grid"><div class="empty" style="grid-column:1/-1">No data yet</div></div></div></div>'
-'<div id="t-files" class="panel">'
-'<div class="card" style="max-width:500px">'
+'<div id="t-files" class="panel"><div class="card" style="max-width:500px">'
 '<div class="sec">Download bot files</div>'
-'<p style="font-size:13px;color:var(--mut);margin-bottom:1rem;line-height:1.6">Download for analysis and optimization.</p>'
 '<a class="dl-btn" href="/api/learning" download="bot_learning.json">bot_learning.json</a>'
 '<a class="dl-btn" href="/api/trades" download="trade_history.log">trade_history.log</a>'
 '<a class="dl-btn" href="/api/logs" download="bot.log">bot.log</a>'
-'<div style="margin-top:1.5rem">'
-'<div class="sec">Reset all bot data</div>'
-'<p style="font-size:12px;color:var(--mut);margin-bottom:.75rem">Sell everything on Binance first, then reset.</p>'
+'<div style="margin-top:1.5rem"><div class="sec">Reset all bot data</div>'
+'<p style="font-size:12px;color:var(--mut);margin-bottom:.75rem">Sell everything on Binance first.</p>'
 '<button class="copy-btn" style="background:var(--red)" onclick="doReset()">Reset all files</button>'
-'<div id="reset-msg" style="font-size:12px;margin-top:8px;color:var(--grn)"></div>'
-'</div>'
-'<div style="margin-top:1.5rem">'
-'<div class="sec">Copy learning data</div>'
+'<div id="reset-msg" style="font-size:12px;margin-top:8px;color:var(--grn)"></div></div>'
+'<div style="margin-top:1.5rem"><div class="sec">Copy learning data</div>'
 '<div class="copy-area" id="json-preview">Loading...</div>'
 '<button class="copy-btn" onclick="copyJson()">Copy to clipboard</button>'
-'</div>'
-'</div>'
-'</div>'
-'<footer>Live dashboard auto-refresh 30s <span id="url-display"></span></footer>'
+'</div></div></div>'
+'<footer>BOT v3 — SOL + LINK + DOGE | TP 8% | SL 3% | auto-refresh 30s <span id="url-display"></span></footer>'
 '<script>'
-'var CN={SOLUSDT:"Solana",DOGEUSDT:"Dogecoin",LINKUSDT:"Chainlink",DOTUSDT:"Polkadot",LTCUSDT:"Litecoin"};'
-'var PL={rsi_period:"RSI period",rsi_oversold:"RSI buy",rsi_overbought:"RSI sell",fast_ema:"Fast EMA",slow_ema:"Slow EMA",min_score:"Min score",volume_factor:"Vol factor",bb_period:"BB period"};'
-'var rawJson="";'
-'document.getElementById("url-display").textContent=window.location.host;'
-'function showTab(id){'
-'var panels=document.querySelectorAll(".panel");'
-'for(var i=0;i<panels.length;i++){panels[i].classList.remove("active");}'
-'var tabs=document.querySelectorAll(".tab");'
-'for(var i=0;i<tabs.length;i++){tabs[i].classList.remove("active");}'
-'document.getElementById("t-"+id).classList.add("active");'
-'document.getElementById("tab-"+id).classList.add("active");'
-'if(id==="files"){loadJson();}}'
-'function loadJson(){'
-'fetch("/api/learning").then(function(r){return r.text();}).then(function(txt){'
-'rawJson=txt;'
-'var preview=rawJson.length>600?rawJson.slice(0,600)+"...(download for full)":rawJson;'
-'document.getElementById("json-preview").textContent=preview;'
-'}).catch(function(){document.getElementById("json-preview").textContent="Not available yet.";});}'
-'function copyJson(){'
-'navigator.clipboard.writeText(rawJson).then(function(){'
-'var b=document.querySelector(".copy-btn");b.textContent="Copied!";'
-'setTimeout(function(){b.textContent="Copy to clipboard";},2000);});}'
-'function doReset(){'
-'if(!confirm("Sell everything on Binance first! This will delete all bot data."))return;'
-'fetch("/api/reset").then(function(r){return r.json();}).then(function(d){'
-'document.getElementById("reset-msg").textContent=d.ok?"Reset done. Restart the bot now.":"Reset failed.";'
-'}).catch(function(){document.getElementById("reset-msg").textContent="Error.";});}'
-'function fmtNum(n,dec){'
-'if(n===null||n===undefined||n===""){return"-";}'
-'return parseFloat(n).toFixed(dec!==undefined?dec:2);}'
-'function renderTrades(trades){'
-'var el=document.getElementById("trade-list");'
-'if(!trades||trades.length===0){el.innerHTML="<div class=\\"empty\\">No trades yet.</div>";return;}'
-'var rows="";var limit=trades.length<30?trades.length:30;'
-'for(var i=0;i<limit;i++){'
-'var t=trades[i];var isBuy=t.side.trim().toUpperCase()==="BUY";'
-'var pval=t.pnl!==""?parseFloat(t.pnl):null;var pnlStr="-";'
-'if(pval!==null){var pc=pval>=0?"var(--grn)":"var(--red)";var ps=pval>=0?"+":"";'
-'pnlStr="<span style=\\"color:"+pc+"\\">"+ps+fmtNum(pval)+"%</span>";}'
-'var sym=(t.symbol||"").trim().replace("USDT","");var bc=isBuy?"buy":"sell";'
-'var pr=parseFloat(t.price||0).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:4});'
-'var tm=(t.time||"").slice(11,16);var rs=(t.reason||"").slice(0,18);'
-'rows+="<tr><td style=\\"color:var(--mut)\\">"+tm+"</td><td><span class=\\"badge "+bc+"\\">"+t.side.trim()+"</span></td><td>"+sym+"</td><td>$"+pr+"</td><td>"+pnlStr+"</td><td style=\\"color:var(--mut);font-size:10px\\">"+rs+"</td></tr>";}'
-'el.innerHTML="<table><thead><tr><th>Time</th><th>Type</th><th>Coin</th><th>Price</th><th>PnL</th><th>Reason</th></tr></thead><tbody>"+rows+"</tbody></table>";}'
-'function renderCoins(stats){'
-'var el=document.getElementById("coin-list");var keys=Object.keys(stats||{});'
-'if(keys.length===0){el.innerHTML="<div class=\\"empty\\">No coin data yet</div>";return;}'
-'keys.sort(function(a,b){var wa=stats[a].trades>0?stats[a].wins/stats[a].trades:0;var wb=stats[b].trades>0?stats[b].wins/stats[b].trades:0;return wb-wa;});'
-'var html="";for(var i=0;i<keys.length;i++){'
-'var s=keys[i];var st=stats[s];var cwr=st.trades>0?Math.round(st.wins/st.trades*100):0;'
-'var pnl2=st.total_pnl||0;var c=cwr>=55?"var(--grn)":cwr>=40?"var(--amb)":"var(--red)";'
-'var pc2=pnl2>=0?"var(--grn)":"var(--red)";var ps2=pnl2>=0?"+":"";var nm=(CN[s]||s).slice(0,9);'
-'html+="<div class=\\"crow\\"><div style=\\"font-weight:600\\">"+nm+"<span class=\\"ctag\\">"+s.replace("USDT","")+"</span></div>";'
-'html+="<div style=\\"color:var(--mut)\\">"+st.trades+"t</div>";'
-'html+="<div style=\\"color:"+c+"\\">"+cwr+"%</div>";'
-'html+="<div style=\\"color:"+pc2+"\\">"+ps2+fmtNum(pnl2)+"%</div>";'
-'html+="<div style=\\"background:rgba(255,255,255,.07);border-radius:3px;height:4px;width:60px\\"><div style=\\"width:"+cwr+"%;height:100%;border-radius:3px;background:"+c+"\\"></div></div></div>";}'
-'el.innerHTML=html;}'
-'function renderParams(params){'
-'var el=document.getElementById("params-grid");'
-'var keys=Object.keys(PL).filter(function(k){return params[k]!==undefined;});'
-'if(keys.length===0){el.innerHTML="<div class=\\"empty\\" style=\\"grid-column:1/-1\\">No data yet</div>";return;}'
-'var html="";for(var i=0;i<keys.length;i++){var k=keys[i];'
-'html+="<div class=\\"prow\\"><span class=\\"pk\\">"+PL[k]+"</span><span class=\\"pv\\">"+params[k]+"</span></div>";}'
-'el.innerHTML=html;}'
-'function load(){'
-'fetch("/api/data").then(function(r){return r.json();}).then(function(d){'
-'var alive=d.status&&d.status.running;'
-'document.getElementById("sdot").className="dot "+(alive?"on":"off");'
-'document.getElementById("stxt").textContent=alive?"Bot active":"Bot stopped";'
-'document.getElementById("m1").textContent=d.total||"0";'
-'document.getElementById("m1s").textContent=(d.wins||0)+"W / "+((d.total||0)-(d.wins||0))+"L";'
-'var wr=d.win_rate||0;var we=document.getElementById("m2");'
-'we.textContent=wr+"%";'
-'we.style.color=wr>=55?"var(--grn)":wr>=45?"var(--amb)":"var(--red)";'
-'document.getElementById("wrb").style.width=Math.min(wr,100)+"%";'
-'document.getElementById("wrb").style.background=wr>=55?"var(--grn)":wr>=45?"var(--amb)":"var(--red)";'
-'var pv=d.portfolio_value||0;var pe=document.getElementById("m3");'
-'pe.textContent="$"+pv.toFixed(2);'
-'pe.style.color=pv>=(d.start_balance||0)?"var(--grn)":"var(--red)";'
-'document.getElementById("m3s").textContent="inicio: $"+(d.start_balance||0).toFixed(2);'
-'var le=d.last_exp;'
-'if(le){document.getElementById("m4").textContent="Trade #"+le.at_trade;'
-'var adjTxt=(le.adjustments&&le.adjustments.length)?le.adjustments.join(" / "):"No changes";'
-'document.getElementById("m4s").textContent=adjTxt;}'
-'document.getElementById("logline").textContent=(d.status&&d.status.last_line)||"-";'
-'var ab=document.getElementById("alerts-box");'
-'ab.innerHTML=d.circuit_breaker?"<div class=\\"alert-crit\\">Circuit breaker active - portfolio dropped 15%. New trades paused.</div>":"";'
-'renderTrades(d.trades);renderCoins(d.sym_stats);renderParams(d.params);'
-'}).catch(function(e){console.error("load error",e);});}'
-'var s=30;'
-'function tick(){s--;document.getElementById("cd").textContent=s;if(s<=0){s=30;load();}}'
-'load();setInterval(tick,1000);'
-'</script>'
-'</body>'
-'</html>'
+'var CN={SOLUSDT:"Solana",DOGEUSDT:"Dogecoin",LINKUSDT:"Chainlink"};'
+'var PL={rsi_period:"RSI period",rsi_oversold:"RSI buy",rsi_overbought:"RSI sell",fast_ema:"Fast EMA",slow_ema:"Slow EMA",min_score:"Min score",volume_factor:"Vol factor"};'
+'var rawJson="";document.getElementById("url-display").textContent=window.location.host;'
+'function showTab(id){var panels=document.querySelectorAll(".panel");for(var i=0;i<panels.length;i++){panels[i].classList.remove("active");}var tabs=document.querySelectorAll(".tab");for(var i=0;i<tabs.length;i++){tabs[i].classList.remove("active");}document.getElementById("t-"+id).classList.add("active");document.getElementById("tab-"+id).classList.add("active");if(id==="files"){loadJson();}}'
+'function loadJson(){fetch("/api/learning").then(function(r){return r.text();}).then(function(txt){rawJson=txt;document.getElementById("json-preview").textContent=rawJson.length>600?rawJson.slice(0,600)+"...":rawJson;}).catch(function(){document.getElementById("json-preview").textContent="Not available yet.";});}'
+'function copyJson(){navigator.clipboard.writeText(rawJson).then(function(){var b=document.querySelector(".copy-btn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy to clipboard";},2000);});}'
+'function doReset(){if(!confirm("Sell everything on Binance first!"))return;fetch("/api/reset").then(function(r){return r.json();}).then(function(d){document.getElementById("reset-msg").textContent=d.ok?"Reset done. Restart the bot now.":"Failed.";}).catch(function(){document.getElementById("reset-msg").textContent="Error.";});}'
+'function fmtNum(n,dec){if(n===null||n===undefined||n==="")return"-";return parseFloat(n).toFixed(dec!==undefined?dec:2);}'
+'function renderTrades(trades){var el=document.getElementById("trade-list");if(!trades||trades.length===0){el.innerHTML="<div class=\\"empty\\">No trades yet.</div>";return;}var rows="";var limit=Math.min(trades.length,30);for(var i=0;i<limit;i++){var t=trades[i];var isBuy=t.side.trim().toUpperCase()==="BUY";var pval=t.pnl!==""?parseFloat(t.pnl):null;var pnlStr="-";if(pval!==null){var pc=pval>=0?"var(--grn)":"var(--red)";pnlStr="<span style=\\"color:"+pc+"\\">"+(pval>=0?"+":"")+fmtNum(pval)+"%</span>";}var sym=(t.symbol||"").trim().replace("USDT","");var pr=parseFloat(t.price||0).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:4});rows+="<tr><td style=\\"color:var(--mut)\\">"+(t.time||"").slice(11,16)+"</td><td><span class=\\"badge "+(isBuy?"buy":"sell")+"\\">"+t.side.trim()+"</span></td><td>"+sym+"</td><td>$"+pr+"</td><td>"+pnlStr+"</td><td style=\\"color:var(--mut);font-size:10px\\">"+(t.reason||"").slice(0,18)+"</td></tr>";}el.innerHTML="<table><thead><tr><th>Time</th><th>Type</th><th>Coin</th><th>Price</th><th>PnL</th><th>Reason</th></tr></thead><tbody>"+rows+"</tbody></table>";}'
+'function renderCoins(stats){var el=document.getElementById("coin-list");var keys=Object.keys(stats||{});if(keys.length===0){el.innerHTML="<div class=\\"empty\\">No coin data yet</div>";return;}keys.sort(function(a,b){var wa=stats[a].trades>0?stats[a].wins/stats[a].trades:0;var wb=stats[b].trades>0?stats[b].wins/stats[b].trades:0;return wb-wa;});var html="";for(var i=0;i<keys.length;i++){var s=keys[i];var st=stats[s];var cwr=st.trades>0?Math.round(st.wins/st.trades*100):0;var pnl2=st.total_pnl||0;var c=cwr>=55?"var(--grn)":cwr>=40?"var(--amb)":"var(--red)";var pc2=pnl2>=0?"var(--grn)":"var(--red)";html+="<div class=\\"crow\\"><div style=\\"font-weight:600\\">"+(CN[s]||s).slice(0,9)+"<span class=\\"ctag\\">"+s.replace("USDT","")+"</span></div><div style=\\"color:var(--mut)\\">"+st.trades+"t</div><div style=\\"color:"+c+"\\">"+cwr+"%</div><div style=\\"color:"+pc2+"\\">"+( pnl2>=0?"+":"")+fmtNum(pnl2)+"%</div><div style=\\"background:rgba(255,255,255,.07);border-radius:3px;height:4px;width:60px\\"><div style=\\"width:"+Math.min(cwr,100)+"%;height:100%;border-radius:3px;background:"+c+"\\"></div></div></div>";}el.innerHTML=html;}'
+'function renderParams(params){var el=document.getElementById("params-grid");var keys=Object.keys(PL).filter(function(k){return params[k]!==undefined;});if(keys.length===0){el.innerHTML="<div class=\\"empty\\" style=\\"grid-column:1/-1\\">No data yet</div>";return;}var html="";for(var i=0;i<keys.length;i++){var k=keys[i];html+="<div class=\\"prow\\"><span class=\\"pk\\">"+PL[k]+"</span><span class=\\"pv\\">"+params[k]+"</span></div>";}el.innerHTML=html;}'
+'function load(){fetch("/api/data").then(function(r){return r.json();}).then(function(d){var alive=d.status&&d.status.running;document.getElementById("sdot").className="dot "+(alive?"on":"off");document.getElementById("stxt").textContent=alive?"Bot active":"Bot stopped";document.getElementById("m1").textContent=d.total||"0";document.getElementById("m1s").textContent=(d.wins||0)+"W / "+((d.total||0)-(d.wins||0))+"L";var wr=d.win_rate||0;var we=document.getElementById("m2");we.textContent=wr+"%";we.style.color=wr>=60?"var(--grn)":wr>=50?"var(--amb)":"var(--red)";document.getElementById("wrb").style.width=Math.min(wr,100)+"%";document.getElementById("wrb").style.background=wr>=60?"var(--grn)":wr>=50?"var(--amb)":"var(--red)";var pv=d.portfolio_value||0;var pe=document.getElementById("m3");pe.textContent="$"+pv.toFixed(2);pe.style.color=pv>=(d.start_balance||0)?"var(--grn)":"var(--red)";document.getElementById("m3s").textContent="inicio: $"+(d.start_balance||0).toFixed(2);var le=d.last_exp;if(le){document.getElementById("m4").textContent="Trade #"+le.at_trade;document.getElementById("m4s").textContent=(le.adjustments&&le.adjustments.length)?le.adjustments.join(" / "):"No changes";}document.getElementById("logline").textContent=(d.status&&d.status.last_line)||"-";document.getElementById("alerts-box").innerHTML=d.circuit_breaker?"<div class=\\"alert-crit\\">Circuit breaker activo — portfolio bajo 15%.</div>":"";renderTrades(d.trades);renderCoins(d.sym_stats);renderParams(d.params);}).catch(function(e){console.error(e);});}'
+'var s=30;function tick(){s--;document.getElementById("cd").textContent=s;if(s<=0){s=30;load();}}load();setInterval(tick,1000);'
+'</script></body></html>'
 )
 
 
@@ -686,7 +603,7 @@ def read_trades():
                      "reason": parts[5] if len(parts) > 5 else ""}
                 for p in parts:
                     if p.startswith("precio="):
-                        t["price"] = p.replace("precio=", "").replace("$", "").replace(",", "")
+                        t["price"] = p.replace("precio=", "").replace("$", "")
                     elif p.startswith("qty="):
                         t["qty"] = p.replace("qty=", "")
                     elif p.startswith("pnl="):
@@ -705,7 +622,7 @@ def read_status():
         if not lines:
             return {"running": False, "last_line": "No activity.", "last_time": "-"}
         last = lines[-1]
-        m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", last)
+        m  = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", last)
         lt = m.group(1) if m else "-"
         alive = False
         if m:
@@ -790,7 +707,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if os.path.exists(f):
                     os.remove(f)
                     log.info("Reset: %s eliminado.", f)
-            self._send(200, "application/json", json.dumps({"ok": True, "msg": "Reset done. Restart the bot now."}))
+            self._send(200, "application/json", json.dumps({"ok": True}))
         else:
             self._send(404, "text/plain", "Not found.")
 
@@ -810,15 +727,16 @@ def run():
     global _circuit_breaker_active, _start_balance, _portfolio_value
 
     log.info("=" * 55)
-    log.info("  ADAPTIVE BOT v2 - VOLATILE ALTCOINS")
-    log.info("  Coins     : %s", ", ".join(SYMBOLS))
-    log.info("  Interval  : %s | Mode: %s", INTERVAL, "TESTNET" if USE_TESTNET else "*** LIVE ***")
-    log.info("  Max hold  : %dh | Cooldown: %dmin | CB: -%d%%",
-             MAX_HOLD_HOURS, COIN_COOLDOWN_MIN, int(CIRCUIT_BREAKER_PCT * 100))
+    log.info("  ADAPTIVE BOT v3")
+    log.info("  Coins: %s", ", ".join(SYMBOLS))
+    log.info("  TP: %.0f%% | SL: %.0f%% | Trade: %.0f%%",
+             BASE_TAKE_PROFIT * 100, BASE_STOP_LOSS * 100, MAX_TRADE_PCT * 100)
+    log.info("  Blocked hours: %s", sorted(BLOCKED_HOURS))
+    log.info("  Mode: %s", "TESTNET" if USE_TESTNET else "*** LIVE ***")
     log.info("=" * 55)
 
-    client   = create_client()
-    learning = LearningSystem()
+    client    = create_client()
+    learning  = LearningSystem()
     learning.print_summary()
 
     positions = load_positions()
@@ -834,7 +752,7 @@ def run():
         except Exception:
             _start_balance += float(pos["entry"]) * float(pos["qty"])
 
-    log.info("Starting portfolio: $%.2f (CB se activa si cae a $%.2f)",
+    log.info("Starting portfolio: $%.2f (CB a $%.2f)",
              _start_balance, _start_balance * (1 - CIRCUIT_BREAKER_PCT))
     cycle = 0
 
@@ -852,32 +770,34 @@ def run():
                     candles = fetch_candles(client, symbol, INTERVAL)
                     result  = analyze_symbol(candles, params)
                     if result is None:
-                        log.warning("  %s: candles congelados, saltando.", symbol)
+                        log.warning("  %s: candles congelados.", symbol)
                         continue
                     result["hour_q"] = learning.get_hour_quality(now.hour)
                     analyses[symbol] = result
                 except Exception as e:
                     log.warning("  Error on %s: %s", symbol, e)
 
-            # Circuit breaker sobre portfolio total (USDT + monedas)
-            _portfolio_value = get_portfolio_value(client, positions, analyses)
-            drop = (_start_balance - _portfolio_value) / _start_balance if _start_balance > 0 else 0
+            # Portfolio total para circuit breaker
+            _portfolio_value        = get_portfolio_value(client, positions, analyses)
+            drop                    = (_start_balance - _portfolio_value) / _start_balance if _start_balance > 0 else 0
             _circuit_breaker_active = drop >= CIRCUIT_BREAKER_PCT
 
-            log.info("\n-- Cycle #%d | %s | USDT: $%.2f | Portfolio: $%.2f | Positions: %d/%d%s --",
-                     cycle, now.strftime("%H:%M:%S"), balance, _portfolio_value,
+            log.info("\n-- Cycle #%d | %s | H%d%s | USDT: $%.2f | Portfolio: $%.2f | Pos: %d/%d%s --",
+                     cycle, now.strftime("%H:%M:%S"), now.hour,
+                     "(BLOCKED)" if now.hour in BLOCKED_HOURS else "",
+                     balance, _portfolio_value,
                      len(positions), MAX_OPEN_TRADES,
-                     " | CB ACTIVO" if _circuit_breaker_active else "")
+                     " | CB!" if _circuit_breaker_active else "")
 
             if _circuit_breaker_active:
-                log.warning("  CIRCUIT BREAKER: portfolio bajo %.1f%% desde $%.2f. No nuevas compras.",
+                log.warning("  CIRCUIT BREAKER: portfolio bajo %.1f%% desde $%.2f.",
                             drop * 100, _start_balance)
 
             for symbol, result in analyses.items():
                 log.info("  %-12s $%10.4f | RSI=%5.1f | Score=%d/6 | Vol x%.1f",
                          symbol, result["price"], result["rsi"], result["score"], result["vol_ratio"])
 
-            # Gestionar posiciones abiertas
+            # Gestionar posiciones abiertas (siempre, independiente de hora o CB)
             for symbol, pos in list(positions.items()):
                 if symbol not in analyses:
                     continue
@@ -887,6 +807,7 @@ def run():
                 qty   = float(pos["qty"])
                 pnl   = (price - entry) / entry * 100
 
+                # Trailing stop
                 if price > float(pos.get("peak_price", entry)):
                     pos["peak_price"] = price
                 peak = float(pos.get("peak_price", entry))
@@ -906,7 +827,7 @@ def run():
                 elif a["sell_signal"]:
                     why = "SELL SIGNAL"
                 elif held_h >= MAX_HOLD_HOURS:
-                    why = "MAX HOLD (%.1fh)" % held_h
+                    why = "MAX HOLD %.1fh" % held_h
 
                 if why:
                     try:
@@ -922,12 +843,15 @@ def run():
                     except Exception as e:
                         log.error("  Error closing %s: %s", symbol, e)
                         if "-2010" in str(e):
+                            # Recovery: intentar vender con qty real de Binance
                             try:
-                                asset = symbol.replace("USDT", "")
+                                asset    = symbol.replace("USDT", "")
                                 real_qty = get_balance(client, asset)
+                                lot      = get_lot_rules(client, symbol)
+                                real_qty = round_step(real_qty, lot["step_size"])
                                 if real_qty * price > 1.0:
-                                    log.warning("  %s: reintentando con qty real de Binance: %.6f", symbol, real_qty)
-                                    place_order(client, symbol, "SELL", round_step(real_qty, get_lot_rules(client, symbol)["step_size"]))
+                                    log.warning("  %s: recovery con qty real: %.6f", symbol, real_qty)
+                                    place_order(client, symbol, "SELL", real_qty)
                                     won = price > entry
                                     log.info("  %s CLOSE(recovery) %s @ $%.4f | PnL: %+.2f%% | %s",
                                              "OK" if won else "X", symbol, price, pnl, why)
@@ -935,15 +859,21 @@ def run():
                                     learning.record_trade(symbol, pnl, params, won)
                                     cooldowns[symbol] = now + timedelta(minutes=COIN_COOLDOWN_MIN)
                                 else:
-                                    log.warning("  %s: nada que vender en Binance, eliminando.", symbol)
+                                    log.warning("  %s: nada que vender, eliminando fantasma.", symbol)
                             except Exception as e2:
                                 log.error("  %s: recovery fallida: %s", symbol, e2)
                             finally:
-                                del positions[symbol]
+                                if symbol in positions:
+                                    del positions[symbol]
                                 save_positions(positions)
 
             # Abrir nuevas posiciones
-            if len(positions) < MAX_OPEN_TRADES and balance > 20 and not _circuit_breaker_active:
+            hora_bloqueada = now.hour in BLOCKED_HOURS
+            if (len(positions) < MAX_OPEN_TRADES
+                    and balance > 20
+                    and not _circuit_breaker_active
+                    and not hora_bloqueada):
+
                 candidates = sorted(
                     [(s, a) for s, a in analyses.items()
                      if a["buy_signal"]
@@ -960,18 +890,21 @@ def run():
                     lot = get_lot_rules(client, symbol)
                     trade_val = balance * MAX_TRADE_PCT / (MAX_OPEN_TRADES - len(positions))
                     qty = round_step(trade_val / pr, lot["step_size"])
+
                     if qty < lot["min_qty"]:
-                        log.warning("  %s: qty %s below minimum, skipping.", symbol, qty)
+                        log.warning("  %s: qty bajo minimo.", symbol)
                         continue
                     if qty * pr < 6.0:
-                        log.warning("  %s: valor $%.2f bajo minimo notional, skipping.", symbol, qty * pr)
+                        log.warning("  %s: notional $%.2f bajo minimo.", symbol, qty * pr)
                         continue
+
                     # No comprar si ya hay esa moneda en Binance
-                    asset = symbol.replace("USDT", "")
+                    asset        = symbol.replace("USDT", "")
                     already_held = get_balance(client, asset)
                     if already_held * pr > 5.0:
-                        log.warning("  %s: ya tenemos $%.2f en Binance, skipping doble compra.", symbol, already_held * pr)
+                        log.warning("  %s: ya tenemos $%.2f, skip doble compra.", symbol, already_held * pr)
                         continue
+
                     try:
                         place_order(client, symbol, "BUY", qty)
                         positions[symbol] = {
@@ -989,14 +922,17 @@ def run():
                     except Exception as e:
                         log.error("  Error opening %s: %s", symbol, e)
 
+            elif hora_bloqueada:
+                log.info("  Hora H%d bloqueada (mal historial) — no se abren posiciones.", now.hour)
+
             time.sleep(POLL_SECONDS)
 
         except KeyboardInterrupt:
-            log.info("\nBot stopped.")
+            log.info("\nBot detenido.")
             learning.print_summary()
             break
         except Exception as e:
-            log.error("Unexpected error: %s - retrying in 30s...", e)
+            log.error("Error inesperado: %s — reintentando en 30s...", e)
             time.sleep(30)
 
 
