@@ -1,26 +1,27 @@
 """
 =============================================================
-  BOT ADAPTATIVO v3.1 - Altcoins Volatiles
-  Cambios vs v3 basados en analisis de 22 trades reales:
+  BOT ADAPTATIVO v3.2 - Altcoins Volatiles
+  Cambios vs v3.1 basados en 26 trades reales:
 
-  NUEVO EN v3.1:
-  - sell_signal SOLO cierra si PnL >= 1.5% (antes cerraba a 0.3%)
-    Razon: trades cerraban con 0.024-0.42% promedio, lo que no
-    cubre las comisiones de Binance (0.2% por trade completo).
-  - MAX_HOLD_HOURS subido de 4 a 8 horas
-    Razon: TP en 8% necesita mas tiempo para alcanzarse.
-  - MIN_SELL_PNL = 1.5% — umbral minimo para cerrar por señal
-    (SL, TP y MAX_HOLD siguen funcionando sin restriccion)
+  NUEVO EN v3.2:
+  - LINK ELIMINADO — 44% WR, -0.02% avg, perdia $0.35 en 9 trades
+  - SOL en observacion — 56% WR, marginal
+  - DOGE protagonista — 75% WR, +0.72% avg, +$0.74 en 8 trades
+  - MIN_SELL_SIGNAL_PNL subido de 1.5% a 2.0%
+    Wins de DOGE promediaban 0.72% — muy por debajo del TP 8%
+  - H23 bloqueada (33% WR en 3 trades)
+  - LEARNING con REVERSION:
+    Si WR cae >15 puntos desde ultimo ajuste, revierte params
+    al set anterior automaticamente
 
-  HEREDADO DE v3:
-  - Solo SOL, LINK, DOGE (LTC y DOT eliminados por perdedores)
-  - TP 8%, SL 3%, Trade 20% del portfolio
-  - Horas H1, H3 bloqueadas (mal historial)
+  HEREDADO:
+  - TP 8%, SL 3%, Trade 20%, Hold 8h
   - Circuit breaker sobre portfolio total
   - Recovery de posiciones fantasma (-2010)
+  - Reconciliacion con update de qty
   - No compra doble de la misma moneda
   - Trailing stop loss
-  - Learning corregido (no baja min_score < 3)
+  - Min_score nunca baja de 3
 =============================================================
 """
 
@@ -39,13 +40,14 @@ API_KEY     = os.environ.get("API_KEY", "")
 API_SECRET  = os.environ.get("API_SECRET", "")
 USE_TESTNET = False
 
+# LINK eliminado. DOGE + SOL (SOL en observacion)
 SYMBOLS = [
-    "SOLUSDT",   # 66% WR historico
-    "LINKUSDT",  # 66% WR historico
-    "DOGEUSDT",  # 86% WR en v3
+    "DOGEUSDT",  # 75% WR, +5.76% PnL — mejor performer
+    "SOLUSDT",   # 56% WR, +0.33% — en observacion
 ]
 
-BLOCKED_HOURS = {1, 3}  # 0% y 20% WR con trades suficientes
+# H23 agregada (33% WR, 3 trades)
+BLOCKED_HOURS = {1, 3, 23}
 
 INTERVAL         = "5m"
 MAX_TRADE_PCT    = 0.20
@@ -53,15 +55,18 @@ BASE_STOP_LOSS   = 0.03
 BASE_TAKE_PROFIT = 0.08
 MAX_OPEN_TRADES  = 2
 
-MAX_HOLD_HOURS    = 8      # subido de 4 — da tiempo al TP de 8%
-COIN_COOLDOWN_MIN = 15
+MAX_HOLD_HOURS      = 8
+COIN_COOLDOWN_MIN   = 15
 CIRCUIT_BREAKER_PCT = 0.15
 TRAIL_TRIGGER_PCT   = 0.02
 TRAIL_DISTANCE_PCT  = 0.02
 
-# CRITICO: sell_signal solo cierra si hay ganancia minima
-# Evita cerrar trades con 0.3% que no cubren comisiones
-MIN_SELL_SIGNAL_PNL = 1.5  # porcentaje minimo de ganancia
+# SUBIDO: los wins promediaban 0.72%, muy lejos del TP 8%
+# Con 2% minimo forzamos mejores salidas
+MIN_SELL_SIGNAL_PNL = 2.0
+
+# Si WR cae mas que esto desde ultimo ajuste → revertir params
+WR_REVERT_THRESHOLD = 0.15
 
 INITIAL_PARAMS = {
     "rsi_period"     : 14,
@@ -99,7 +104,7 @@ log = logging.getLogger("AdaptiveBot")
 
 
 # =============================================================
-#   LEARNING SYSTEM
+#   LEARNING SYSTEM v3.2 — con reversion
 # =============================================================
 
 class LearningSystem:
@@ -159,20 +164,46 @@ class LearningSystem:
         adj   = []
         log.info("[LEARNING] Win rate: %.1f%% en %d trades.", wr * 100, total)
 
-        # min_score: nunca baja de 3
-        if wr < 0.50 and p["min_score"] < 5:
+        # NUEVO: Reversion si WR cayo mucho desde el ultimo ajuste
+        exps = self.data.get("param_experiments", [])
+        if exps:
+            last = exps[-1]
+            last_wr = last.get("win_rate", 0)
+            if last_wr - wr >= WR_REVERT_THRESHOLD and last.get("adjustments"):
+                # El ultimo ajuste empeoro el performance — revertir
+                log.warning("[LEARNING] WR cayo de %.1f%% a %.1f%% — REVIRTIENDO params.",
+                            last_wr * 100, wr * 100)
+                # Buscar el penultimo experimento para obtener params previos
+                if len(exps) >= 2:
+                    prev_params = exps[-2].get("new_params", dict(INITIAL_PARAMS))
+                else:
+                    prev_params = dict(INITIAL_PARAMS)
+                for k, v in prev_params.items():
+                    p[k] = v
+                adj.append("REVERTED")
+                self.data["param_experiments"].append({
+                    "at_trade": total, "win_rate": round(wr, 3),
+                    "adjustments": adj, "new_params": dict(p),
+                })
+                self.data["last_adjusted"] = datetime.now().isoformat()
+                log.info("[LEARNING] Params revertidos a version previa.")
+                self._save()
+                return
+
+        # Ajustes normales — umbral cambiado a <0.52 para ser mas proactivo
+        if wr < 0.52 and p["min_score"] < 5:
             p["min_score"] = min(p["min_score"] + 1, 5)
             adj.append("min_score up")
         elif wr > 0.65 and p["min_score"] > 3:
             p["min_score"] = max(p["min_score"] - 1, 3)
             adj.append("min_score down")
 
-        # RSI: solo relaja si WR > 0.60
-        if wr <= 0.50:
+        if wr < 0.52:
             p["rsi_oversold"]   = max(22, p["rsi_oversold"] - 2)
             p["rsi_overbought"] = min(78, p["rsi_overbought"] + 2)
             adj.append("RSI stricter")
-        elif wr > 0.60:
+        elif wr > 0.65:
+            # Umbral subido de 0.60 a 0.65 — mas conservador
             p["rsi_oversold"]   = min(32, p["rsi_oversold"] + 1)
             p["rsi_overbought"] = max(68, p["rsi_overbought"] - 1)
             adj.append("RSI looser")
@@ -209,8 +240,9 @@ class LearningSystem:
         t = self.data["total_trades"]
         w = self.data["total_wins"]
         log.info("=" * 55)
-        log.info("  BOT v3.1 | %d trades | WR %.1f%%",
+        log.info("  BOT v3.2 | %d trades | WR %.1f%%",
                  t, w / t * 100 if t > 0 else 0)
+        log.info("  Coins: %s", ", ".join(SYMBOLS))
         log.info("  TP %.0f%% | SL %.0f%% | Hold %dh | MinSell %.1f%%",
                  BASE_TAKE_PROFIT * 100, BASE_STOP_LOSS * 100,
                  MAX_HOLD_HOURS, MIN_SELL_SIGNAL_PNL)
@@ -260,7 +292,7 @@ def reconcile_positions(client, positions):
                             symbol, qty_tracked, held)
                 to_remove.append(symbol)
             elif held > qty_tracked * 1.05:
-                log.warning("  Reconcile: %s actualizando qty %.4f -> %.4f.",
+                log.warning("  Reconcile: %s qty %.4f -> %.4f.",
                             symbol, qty_tracked, held)
                 positions[symbol]["qty"] = held
             else:
@@ -268,7 +300,7 @@ def reconcile_positions(client, positions):
         for symbol in to_remove:
             del positions[symbol]
         save_positions(positions)
-        log.info("Reconciliacion lista. %d posicion(es).", len(positions))
+        log.info("Reconciliacion: %d posicion(es).", len(positions))
     except Exception as e:
         log.error("Error en reconciliacion: %s", e)
     return positions
@@ -375,14 +407,14 @@ def analyze_symbol(candles, params):
     if rsi < params["rsi_oversold"]:
         score += 1; detail.append("RSI=%.1f" % rsi)
     if len(fe) >= 2 and len(se) >= 2 and fe[-2] <= se[-2] and fe[-1] > se[-1]:
-        score += 1; detail.append("EMA cross")
+        score += 1; detail.append("EMA")
     bb_range = bb_u - bb_l
     if bb_range > 0 and (price - bb_l) / bb_range < 0.25:
-        score += 1; detail.append("BB lower")
+        score += 1; detail.append("BB")
     if mh > ph and mh < 0:
         score += 1; detail.append("MACD")
     if vol_r >= params["volume_factor"]:
-        score += 1; detail.append("Vol x%.1f" % vol_r)
+        score += 1; detail.append("Vol")
 
     sell = (rsi > params["rsi_overbought"] or
             (len(fe) >= 2 and len(se) >= 2 and fe[-2] >= se[-2] and fe[-1] < se[-1]) or
@@ -475,7 +507,7 @@ def log_trade(symbol, side, price, qty, pnl_pct=None, reason=""):
 DASHBOARD_HTML = (
 '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">'
 '<meta name="viewport" content="width=device-width,initial-scale=1">'
-'<title>Crypto Bot v3.1</title>'
+'<title>Crypto Bot v3.2</title>'
 '<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@400;700&display=swap" rel="stylesheet">'
 '<style>'
 ':root{--bg:#0b0e13;--sur:#111620;--sur2:#181e2c;--bor:rgba(255,255,255,0.07);--txt:#e8eaf0;--mut:#6b7280;--grn:#10d98c;--red:#f05252;--blu:#5b8ff9;--amb:#f5a623}'
@@ -517,7 +549,7 @@ DASHBOARD_HTML = (
 'footer{text-align:center;margin-top:2rem;font-size:11px;color:var(--mut);font-family:IBM Plex Mono,monospace}'
 '@media(max-width:800px){.metrics{grid-template-columns:1fr 1fr}}'
 '</style></head><body>'
-'<header><div class="logo">CRYPTO<span>BOT</span> v3.1</div>'
+'<header><div class="logo">CRYPTO<span>BOT</span> v3.2</div>'
 '<div style="display:flex;align-items:center;gap:12px">'
 '<div style="font-size:11px;color:var(--mut)">Refresh <span id="cd">30</span>s</div>'
 '<div class="pill"><span class="dot off" id="sdot"></span>&nbsp;<span id="stxt">Loading</span></div>'
@@ -555,9 +587,9 @@ DASHBOARD_HTML = (
 '<div class="copy-area" id="json-preview">Loading...</div>'
 '<button class="copy-btn" onclick="copyJson()">Copy to clipboard</button>'
 '</div></div></div>'
-'<footer>v3.1 | SOL+LINK+DOGE | TP 8% | SL 3% | Hold 8h | MinSell 1.5% | auto-refresh 30s</footer>'
+'<footer>v3.2 | DOGE+SOL | TP 8% | SL 3% | MinSell 2% | Learning with reversion | auto-refresh 30s</footer>'
 '<script>'
-'var CN={SOLUSDT:"Solana",DOGEUSDT:"Dogecoin",LINKUSDT:"Chainlink"};'
+'var CN={SOLUSDT:"Solana",DOGEUSDT:"Dogecoin"};'
 'var PL={rsi_period:"RSI period",rsi_oversold:"RSI buy",rsi_overbought:"RSI sell",fast_ema:"Fast EMA",slow_ema:"Slow EMA",min_score:"Min score",volume_factor:"Vol factor"};'
 'var rawJson="";'
 'function showTab(id){document.querySelectorAll(".panel").forEach(function(p){p.classList.remove("active");});document.querySelectorAll(".tab").forEach(function(t){t.classList.remove("active");});document.getElementById("t-"+id).classList.add("active");document.getElementById("tab-"+id).classList.add("active");if(id==="files")loadJson();}'
@@ -726,12 +758,13 @@ def run():
     global _circuit_breaker_active, _start_balance, _portfolio_value
 
     log.info("=" * 55)
-    log.info("  ADAPTIVE BOT v3.1")
+    log.info("  ADAPTIVE BOT v3.2")
     log.info("  Coins : %s", ", ".join(SYMBOLS))
     log.info("  TP %.0f%% | SL %.0f%% | Hold %dh | MinSell %.1f%%",
              BASE_TAKE_PROFIT * 100, BASE_STOP_LOSS * 100,
              MAX_HOLD_HOURS, MIN_SELL_SIGNAL_PNL)
     log.info("  Blocked hours: %s", sorted(BLOCKED_HOURS))
+    log.info("  Learning: revert if WR drops >%.0f points", WR_REVERT_THRESHOLD * 100)
     log.info("  Mode: %s", "TESTNET" if USE_TESTNET else "*** LIVE ***")
     log.info("=" * 55)
 
@@ -822,7 +855,6 @@ def run():
                 elif price >= float(pos["take_profit"]):
                     why = "TAKE PROFIT"
                 elif a["sell_signal"] and pnl >= MIN_SELL_SIGNAL_PNL:
-                    # CRITICO: solo cierra por señal si hay ganancia real suficiente
                     why = "SELL SIGNAL %.1f%%" % pnl
                 elif a["sell_signal"] and pnl < MIN_SELL_SIGNAL_PNL:
                     log.info("  %s: sell_signal pero PnL %.2f%% < %.1f%% minimo — manteniendo.",
